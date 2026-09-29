@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
-from src.splitbill.models import ShareStatus, SplitBillStatus
+from src.splitbill.models import SharePayoutStatus, ShareStatus, SplitBillStatus
 
 
 class SplitBillCreate(BaseModel):
@@ -19,6 +19,7 @@ class ShareRead(BaseModel):
     user_id: uuid.UUID
     gross_amount: Decimal
     status: ShareStatus
+    payout_status: SharePayoutStatus
     created_at: datetime
     paid_at: datetime | None
 

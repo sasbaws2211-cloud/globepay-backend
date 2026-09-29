@@ -32,6 +32,22 @@ def _to_subunit(amount: Decimal) -> int:
     return int(amount * 100)
 
 
+def to_local_momo_number(number: str) -> str:
+    """Paystack Ghana only accepts mobile_money account numbers in local
+    0XXXXXXXXX form - "+233240000002" is rejected with "Account number is
+    invalid" - while users (and the seed data) store numbers in +233 form.
+    Normalize +233/233/bare 9-digit forms; anything unrecognized is passed
+    through unchanged so Paystack's own validation message still surfaces."""
+    digits = "".join(ch for ch in number if ch.isdigit())
+    if len(digits) == 12 and digits.startswith("233"):
+        return "0" + digits[3:]
+    if len(digits) == 9:
+        return "0" + digits
+    if len(digits) == 10 and digits.startswith("0"):
+        return digits
+    return number.strip()
+
+
 async def initialize_transaction(
     email: str, amount: Decimal, reference: str, metadata: dict | None = None
 ) -> dict:
@@ -68,7 +84,7 @@ async def create_transfer_recipient(
     payload = {
         "type": "mobile_money",
         "name": name,
-        "account_number": account_number,
+        "account_number": to_local_momo_number(account_number),
         "bank_code": bank_code,
         "currency": currency,
     }
@@ -94,6 +110,23 @@ async def initiate_transfer(amount: Decimal, recipient_code: str, reason: str, r
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to initiate transfer"), body)
     return body["data"]
+
+
+async def verify_transfer(reference: str) -> dict:
+    """Current state of an outbound payout. data.status is one of
+    pending / queued / processing / otp / success / failed / reversed -
+    used to reconcile payouts whose transfer.* webhook never arrived."""
+    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
+        resp = await client.get(f"/transfer/verify/{reference}", headers=_headers())
+    body = resp.json()
+    if not body.get("status"):
+        raise PaystackError(body.get("message", "Failed to verify transfer"), body)
+    return body["data"]
+
+
+# Paystack payout statuses that are final, mapped to the webhook event the
+# transfer.* handlers already understand.
+TRANSFER_FINAL_EVENTS = {"success": "transfer.success", "failed": "transfer.failed", "reversed": "transfer.reversed"}
 
 
 async def charge_authorization(authorization_code: str, email: str, amount: Decimal, reference: str) -> dict:
@@ -133,3 +166,19 @@ async def refund_transaction(reference: str, amount: Decimal | None = None) -> d
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to initiate refund"), body)
     return body["data"]
+
+
+async def fetch_refund(refund_id: str) -> dict:
+    """GET /refund/{id} - the refund's current state (confirmed live: a fresh
+    refund reads "pending"). Paystack statuses: pending / processing /
+    processed / failed (plus needs-attention, which isn't final)."""
+    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
+        resp = await client.get(f"/refund/{refund_id}", headers=_headers())
+    body = resp.json()
+    if not body.get("status"):
+        raise PaystackError(body.get("message", "Failed to fetch refund"), body)
+    return body["data"]
+
+
+# Final refund states; anything else means "still in progress, check again later".
+REFUND_FINAL_STATUSES = ("processed", "failed")

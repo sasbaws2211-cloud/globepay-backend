@@ -29,6 +29,21 @@ from src.common.bitnob_client import BitnobError, request  # noqa: F401 - re-exp
 
 MICRO_UNITS_PER_UNIT = 1_000_000
 
+# Lite cards - the only card type this app issues (create_lite_card). From
+# https://bitnob.dev/api-reference/virtual-cards: "you can only spend and
+# terminate a lite card - funding is not supported", with a $250 cap on the
+# one-time load at creation. Confirmed live 2026-09-29: top-ups fail with
+# "topups are not supported for lite cards".
+LITE_MAX_LOAD_USD = 250
+# Not in Bitnob's docs - observed live in sandbox ("customer already has 3
+# active cards, maximum is 3"). Bitnob matches a lite-card customer by phone
+# number, not email, so the cap is per phone number.
+MAX_LITE_CARDS_PER_CUSTOMER = 3
+# Bitnob's published fee schedule: $1.00 per card created, charged to the
+# company wallet (the card itself receives the full load - confirmed on a
+# real sandbox card's transactions).
+CARD_CREATION_FEE_USD = 1
+
 
 def to_micro_units(amount: Decimal) -> int:
     return int(amount * MICRO_UNITS_PER_UNIT)
@@ -52,12 +67,10 @@ async def create_lite_card(
     full flow (create_customer -> update_customer_kyc -> create_card)
     got stuck on kyc_status never leaving "" even with complete
     demographic data submitted. Creates the customer AND the card in one
-    call from just basic contact details. Documented constraint worth
-    verifying against a real response: "spending is not supported, and
-    the maximum top-up is $250" for lite cards - if that's literal, a
-    lite card may only ever hold/move a balance, not be usable for an
-    actual online purchase, which would matter a lot for a feature
-    explicitly meant to enable online payment."""
+    call from just basic contact details (Bitnob reuses an existing
+    customer with the same phone number). Per the current docs a lite card
+    CAN be spent with and terminated, but never funded again - `amount`
+    here (max LITE_MAX_LOAD_USD) is the only money it will ever receive."""
     body = {
         "type": "lite",
         "amount": to_micro_units(amount),
@@ -73,6 +86,15 @@ async def create_lite_card(
         },
     }
     return await request("POST", "/api/cards/lite", body)
+
+
+async def find_customer_by_phone(phone_number: str) -> dict | None:
+    """GET /api/customers?phone_number= - confirmed live to filter exactly.
+    The customer record carries card_counts ({active, frozen, pending, ...}),
+    which is what the per-customer card cap is checked against."""
+    data = (await request("GET", f"/api/customers?phone_number={phone_number}")).get("data") or {}
+    customers = data.get("customers") or []
+    return customers[0] if customers else None
 
 
 async def create_customer(email: str, first_name: str, last_name: str, customer_type: str = "individual") -> dict:

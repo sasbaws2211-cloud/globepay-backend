@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -10,6 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import ReferralRewardStatus, User
 from src.common.kyc_limits import check_transaction_limit, record_transaction_volume
+from src.common.locking import locked_first
 from src.common.sms import send_sms
 from src.config import settings
 from src.payments import paystack
@@ -25,6 +27,9 @@ from src.vaults.models import (
 )
 from src.vaults.schemas import VaultCreate, WithdrawalRequest
 
+logger = logging.getLogger(__name__)
+
+VAULT_PAYOUT_REFERENCE_PREFIX = "vault-wd-"
 REFERRAL_BONUS_GHS = Decimal("5.00")
 MAX_RECURRING_FAILURES = 3
 
@@ -243,11 +248,9 @@ def _save_card_authorization(user: User, verified: dict) -> None:
 
 
 async def confirm_contribution(session: AsyncSession, reference: str) -> VaultContribution:
-    """Called from the Paystack webhook handler once a charge succeeds."""
-    result = await session.exec(
-        select(VaultContribution).where(VaultContribution.payment_reference == reference)
-    )
-    contribution = result.first()
+    """Called from the Paystack webhook handler once a charge succeeds, and
+    from the refresh/reconcile pollers - locked so they can't double-credit."""
+    contribution = await locked_first(session, VaultContribution, VaultContribution.payment_reference == reference)
     if contribution is None:
         raise HTTPException(status_code=404, detail="Contribution not found")
 
@@ -275,6 +278,14 @@ async def confirm_contribution(session: AsyncSession, reference: str) -> VaultCo
 async def request_withdrawal(
     session: AsyncSession, vault: Vault, payload: WithdrawalRequest
 ) -> VaultWithdrawal:
+    # Lock the vault row so a double-tapped Withdraw can't pass the checks
+    # below twice and fire two payouts of the same balance. populate_existing
+    # re-reads the row even though `vault` is already in the identity map.
+    result = await session.exec(
+        select(Vault).where(Vault.id == vault.id).with_for_update().execution_options(populate_existing=True)
+    )
+    vault = result.one()
+
     if vault.status == VaultStatus.WITHDRAWN:
         raise HTTPException(status_code=400, detail="Vault already withdrawn")
 
@@ -298,18 +309,32 @@ async def request_withdrawal(
     )
     session.add(withdrawal)
 
-    recipient_code = await paystack.create_transfer_recipient(
-        name=payload.account_name,
-        account_number=payload.momo_number,
-        bank_code=payload.momo_network_bank_code,
-    )
-    reference = f"vault-wd-{withdrawal.id}"
-    transfer = await paystack.initiate_transfer(
-        amount=net, recipient_code=recipient_code, reason="Vault withdrawal", reference=reference
-    )
+    try:
+        recipient_code = await paystack.create_transfer_recipient(
+            name=payload.account_name,
+            account_number=payload.momo_number,
+            bank_code=payload.momo_network_bank_code,
+        )
+        reference = f"{VAULT_PAYOUT_REFERENCE_PREFIX}{withdrawal.id}"
+        transfer = await paystack.initiate_transfer(
+            amount=net, recipient_code=recipient_code, reason="Vault withdrawal", reference=reference
+        )
+    except paystack.PaystackError as exc:
+        # Nothing was sent - drop the uncommitted withdrawal and leave the
+        # vault untouched so the owner can fix their details and retry.
+        await session.rollback()
+        raise HTTPException(status_code=502, detail=f"Withdrawal could not be started: {exc}") from exc
 
+    # PENDING until the transfer.success / transfer.failed webhook lands -
+    # see handle_payout_event. Paystack accepting the request isn't delivery.
     withdrawal.payout_reference = transfer.get("reference", reference)
     withdrawal.status = WithdrawalStatus.PENDING
+    if transfer.get("status") == "otp":
+        logger.warning(
+            "Vault withdrawal payout %s is held for OTP - Transfer OTP is enabled on the Paystack "
+            "account, so it won't be sent until finalized in the Paystack dashboard.",
+            withdrawal.payout_reference,
+        )
 
     vault.balance = Decimal("0.00")
     vault.status = VaultStatus.WITHDRAWN
@@ -327,6 +352,54 @@ async def request_withdrawal(
         f"(after GHS {withdrawal.platform_fee} fee) is on its way to your mobile money wallet.",
     )
 
+    return withdrawal
+
+
+async def handle_payout_event(session: AsyncSession, event: str, reference: str) -> VaultWithdrawal | None:
+    """Paystack transfer.success / transfer.failed / transfer.reversed webhook
+    for a vault withdrawal payout."""
+    result = await session.exec(
+        select(VaultWithdrawal)
+        .where(VaultWithdrawal.payout_reference == reference)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    withdrawal = result.first()
+    if withdrawal is None or withdrawal.status != WithdrawalStatus.PENDING:
+        return withdrawal  # unknown/stale reference or already processed (duplicate delivery)
+
+    vault_result = await session.exec(
+        select(Vault).where(Vault.id == withdrawal.vault_id).with_for_update().execution_options(populate_existing=True)
+    )
+    vault = vault_result.one()
+    owner = await session.get(User, vault.owner_id)
+
+    if event == "transfer.success":
+        withdrawal.status = WithdrawalStatus.COMPLETED
+        await send_sms(
+            owner.phone_number,
+            f"Your '{vault.name}' vault withdrawal of GHS {withdrawal.net_amount} has been delivered "
+            f"to your mobile money wallet.",
+        )
+    else:
+        # Failed or reversed: the money is back in the platform's Paystack
+        # balance, so it must go back into the vault rather than vanish.
+        # The fee was never realized either (admin stats exclude FAILED).
+        logger.warning("Vault withdrawal payout %s: %s - restoring vault balance", reference, event)
+        withdrawal.status = WithdrawalStatus.FAILED
+        vault.balance += withdrawal.gross_amount
+        vault.status = VaultStatus.ACTIVE
+        vault.updated_at = datetime.now(timezone.utc)
+        session.add(vault)
+        await send_sms(
+            owner.phone_number,
+            f"We couldn't deliver your '{vault.name}' withdrawal to your mobile money wallet. "
+            f"GHS {withdrawal.gross_amount} is back in your vault - check your details and withdraw again.",
+        )
+
+    session.add(withdrawal)
+    await session.commit()
+    await session.refresh(withdrawal)
     return withdrawal
 
 
@@ -486,12 +559,9 @@ async def generate_vault_statement_csv(session: AsyncSession, vault: Vault) -> s
         .where(VaultContribution.vault_id == vault.id, VaultContribution.status == ContributionStatus.PAID)
         .order_by(VaultContribution.paid_at.asc())
     )
-    # No code path in this app ever transitions a withdrawal from PENDING to
-    # COMPLETED (there's no async transfer-completion tracking) - PENDING
-    # here means "a real Paystack transfer was actually initiated", so it
-    # belongs on the statement same as everywhere else that reasons about
-    # withdrawals (e.g. admin platform-fee stats count every row
-    # unconditionally). Only FAILED is excluded.
+    # PENDING means a real Paystack payout was initiated and is in flight
+    # (handle_payout_event moves it to COMPLETED or FAILED), so it belongs on
+    # the statement. FAILED is excluded - its amount was restored to the vault.
     withdrawals_result = await session.exec(
         select(VaultWithdrawal)
         .where(VaultWithdrawal.vault_id == vault.id, VaultWithdrawal.status != WithdrawalStatus.FAILED)

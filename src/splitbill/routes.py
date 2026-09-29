@@ -59,6 +59,18 @@ async def cancel_split(
     return await _to_read(session, bill)
 
 
+@router.post("/{split_bill_id}/shares/{share_id}/retry-payout", response_model=ShareRead)
+async def retry_share_payout(
+    split_bill_id: uuid.UUID,
+    share_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    bill = await service.get_split_bill(session, split_bill_id)
+    share = await service.retry_share_payout(session, bill, share_id, current_user.id)
+    return ShareRead(**share.model_dump())
+
+
 @router.get("/pending/me", response_model=list[ShareRead])
 async def my_pending_shares(
     current_user: User = Depends(get_current_user),

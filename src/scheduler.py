@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlmodel.ext.asyncio.session import AsyncSession as SQLModelAsyncSession
 
 from src.db.main import engine
+from src.payments.reconcile import sweep_in_flight_payments
 from src.vaults.service import sweep_recurring_charges
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,16 @@ async def _run_recurring_charge_sweep() -> None:
             logger.exception("Recurring charge sweep failed")
 
 
+async def _run_payment_reconcile_sweep() -> None:
+    async with SQLModelAsyncSession(engine, expire_on_commit=False) as session:
+        try:
+            count = await sweep_in_flight_payments(session)
+            if count:
+                logger.info("Payment reconcile sweep: %d item(s) updated", count)
+        except Exception:
+            logger.exception("Payment reconcile sweep failed")
+
+
 def start() -> None:
     scheduler.add_job(
         _run_recurring_charge_sweep,
@@ -39,6 +50,15 @@ def start() -> None:
         hours=1,
         id="recurring_charge_sweep",
         replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_payment_reconcile_sweep,
+        "interval",
+        minutes=2,
+        id="payment_reconcile_sweep",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
     scheduler.start()

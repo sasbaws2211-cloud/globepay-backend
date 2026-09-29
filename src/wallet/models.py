@@ -11,6 +11,10 @@ from src.common.db_types import tz_aware_column
 class TransferStatus(StrEnum):
     PENDING_PAYMENT = "pending_payment"  # waiting for sender to pay in
     AWAITING_RECIPIENT_PAYOUT_INFO = "awaiting_recipient_payout_info"
+    # Paystack accepted the payout request but hasn't delivered it yet (it may
+    # be queued, or held at "otp" if Transfer OTP is enabled on the account).
+    # Only the transfer.success webhook moves this to COMPLETED.
+    PAYOUT_PENDING = "payout_pending"
     COMPLETED = "completed"
     FAILED = "failed"
 

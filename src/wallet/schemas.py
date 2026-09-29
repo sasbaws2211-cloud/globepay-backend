@@ -2,21 +2,22 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 
 from src.wallet.models import TransferStatus
 
 
 class TransferInitiate(BaseModel):
     recipient_phone_number: str
-    amount: Decimal
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
     note: str | None = None
-    sender_email: str
+    sender_email: EmailStr
 
 
 class TransferInitiateResponse(BaseModel):
     authorization_url: str
     reference: str
+    transfer_id: uuid.UUID | None = None  # absent on idempotent replays recorded before it was added
 
 
 class TransferRead(BaseModel):

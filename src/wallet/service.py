@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -17,6 +18,7 @@ from src.vaults.service import credit_roundup
 from src.wallet.models import TransferStatus, WalletTransfer
 from src.wallet.schemas import TransferClaim, WalletSummary
 
+logger = logging.getLogger(__name__)
 
 async def get_transfer(session: AsyncSession, transfer_id: uuid.UUID) -> WalletTransfer:
     transfer = await session.get(WalletTransfer, transfer_id)
@@ -65,37 +67,67 @@ async def initiate_transfer(
     await session.commit()
     await session.refresh(transfer)
 
-    data = await paystack.initialize_transaction(
-        email=sender_email,
-        amount=amount + roundup,  # sender pays the transfer plus their round-up in one charge
-        reference=reference,
-        metadata={"type": "wallet_transfer", "transfer_id": str(transfer.id)},
+    try:
+        data = await paystack.initialize_transaction(
+            email=sender_email,
+            amount=amount + roundup,  # sender pays the transfer plus their round-up in one charge
+            reference=reference,
+            metadata={"type": "wallet_transfer", "transfer_id": str(transfer.id)},
+        )
+    except paystack.PaystackError:
+        transfer.status = TransferStatus.FAILED
+        session.add(transfer)
+        await session.commit()
+        raise
+    return {"authorization_url": data["authorization_url"], "reference": reference, "transfer_id": str(transfer.id)}
+
+
+PAYOUT_REFERENCE_PREFIX = "wallet-payout-"
+
+
+async def _locked_transfer(session: AsyncSession, *where) -> WalletTransfer | None:
+    """SELECT ... FOR UPDATE, so a duplicate webhook delivery or a double-tapped
+    claim waits for the first to commit and then sees its new status.
+    populate_existing forces a re-read even if the row is already in the
+    session's identity map, otherwise the lock would return stale state."""
+    result = await session.exec(
+        select(WalletTransfer).where(*where).with_for_update().execution_options(populate_existing=True)
     )
-    return {"authorization_url": data["authorization_url"], "reference": reference}
+    return result.first()
 
 
 async def _payout_to_destination(
     transfer: WalletTransfer, momo_number: str, momo_bank_code: str, account_name: str
-) -> str:
+) -> None:
+    """Request the payout and move the transfer to PAYOUT_PENDING. Paystack's
+    response only means the request was accepted - delivery is confirmed (or
+    failed/reversed) later via the transfer.* webhook, see handle_payout_event."""
     recipient_code = await paystack.create_transfer_recipient(
         name=account_name, account_number=momo_number, bank_code=momo_bank_code
     )
-    reference = f"wallet-payout-{transfer.id}"
+    # Unique per attempt: a failed/reversed payout sends the transfer back to
+    # the recipient to re-claim, and Paystack rejects a reused reference.
+    reference = f"{PAYOUT_REFERENCE_PREFIX}{transfer.id}-{uuid.uuid4().hex[:8]}"
     result = await paystack.initiate_transfer(
         amount=transfer.net_amount,
         recipient_code=recipient_code,
         reason=transfer.note or "Wallet transfer",
         reference=reference,
     )
-    return result.get("reference", reference)
+    transfer.payout_reference = result.get("reference", reference)
+    transfer.status = TransferStatus.PAYOUT_PENDING
+    if result.get("status") == "otp":
+        logger.warning(
+            "Payout %s for wallet transfer %s is held for OTP - Transfer OTP is enabled on the "
+            "Paystack account, so it won't be sent until finalized in the Paystack dashboard "
+            "(or OTP is disabled for API transfers).",
+            transfer.payout_reference, transfer.id,
+        )
 
 
 async def confirm_transfer_payment(session: AsyncSession, reference: str) -> WalletTransfer:
     """Called from the Paystack webhook handler once the sender's charge succeeds."""
-    result = await session.exec(
-        select(WalletTransfer).where(WalletTransfer.payment_reference == reference)
-    )
-    transfer = result.first()
+    transfer = await _locked_transfer(session, WalletTransfer.payment_reference == reference)
     if transfer is None:
         raise HTTPException(status_code=404, detail="Transfer not found")
 
@@ -120,19 +152,27 @@ async def confirm_transfer_payment(session: AsyncSession, reference: str) -> Wal
     recipient = await session.get(User, transfer.recipient_id)
 
     if recipient.default_momo_number and recipient.default_momo_bank_code:
-        transfer.payout_reference = await _payout_to_destination(
-            transfer,
-            recipient.default_momo_number,
-            recipient.default_momo_bank_code,
-            recipient.default_account_name or recipient.full_name,
-        )
-        transfer.status = TransferStatus.COMPLETED
-        transfer.completed_at = datetime.now(timezone.utc)
-        await send_sms(
-            recipient.phone_number,
-            f"You've received GHS {transfer.net_amount} from {sender.full_name} "
-            f"and it's on its way to your mobile money wallet.",
-        )
+        try:
+            await _payout_to_destination(
+                transfer,
+                recipient.default_momo_number,
+                recipient.default_momo_bank_code,
+                recipient.default_account_name or recipient.full_name,
+            )
+            await send_sms(
+                recipient.phone_number,
+                f"You've received GHS {transfer.net_amount} from {sender.full_name} "
+                f"and it's on its way to your mobile money wallet.",
+            )
+        except paystack.PaystackError as exc:
+            # The charge is settled, so leave the transfer claimable instead of
+            # returning a webhook error that can trigger duplicate processing.
+            logger.warning("Auto-payout for wallet transfer %s failed: %s", transfer.id, exc)
+            transfer.status = TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO
+            await send_sms(
+                recipient.phone_number,
+                f"Your GHS {transfer.net_amount} transfer needs payout details before it can be delivered.",
+            )
     else:
         transfer.status = TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO
         await send_sms(
@@ -148,18 +188,22 @@ async def confirm_transfer_payment(session: AsyncSession, reference: str) -> Wal
 
 
 async def claim_transfer(
-    session: AsyncSession, transfer: WalletTransfer, requester_id: uuid.UUID, payload: TransferClaim
+    session: AsyncSession, transfer_id: uuid.UUID, requester_id: uuid.UUID, payload: TransferClaim
 ) -> WalletTransfer:
+    transfer = await _locked_transfer(session, WalletTransfer.id == transfer_id)
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="Transfer not found")
     if transfer.recipient_id != requester_id:
         raise HTTPException(status_code=403, detail="Only the recipient can claim this transfer")
     if transfer.status != TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO:
         raise HTTPException(status_code=400, detail="This transfer is not awaiting payout info")
 
-    transfer.payout_reference = await _payout_to_destination(
-        transfer, payload.momo_number, payload.momo_bank_code, payload.account_name
-    )
-    transfer.status = TransferStatus.COMPLETED
-    transfer.completed_at = datetime.now(timezone.utc)
+    try:
+        await _payout_to_destination(transfer, payload.momo_number, payload.momo_bank_code, payload.account_name)
+    except paystack.PaystackError as exc:
+        # Nothing was sent - the transfer stays claimable so the recipient can
+        # correct their details and try again.
+        raise HTTPException(status_code=502, detail=f"Payout could not be started: {exc}") from exc
     session.add(transfer)
 
     if payload.save_as_default:
@@ -170,6 +214,79 @@ async def claim_transfer(
         session.add(recipient)
 
     await session.commit()
+    await session.refresh(transfer)
+    return transfer
+
+
+async def handle_payout_event(session: AsyncSession, event: str, reference: str) -> WalletTransfer | None:
+    """Paystack transfer.success / transfer.failed / transfer.reversed webhook
+    for a wallet payout - the only place a transfer becomes COMPLETED."""
+    transfer = await _locked_transfer(session, WalletTransfer.payout_reference == reference)
+    if transfer is None or transfer.status != TransferStatus.PAYOUT_PENDING:
+        return transfer  # unknown/stale reference or already processed (duplicate delivery)
+
+    recipient = await session.get(User, transfer.recipient_id)
+    if event == "transfer.success":
+        transfer.status = TransferStatus.COMPLETED
+        transfer.completed_at = datetime.now(timezone.utc)
+        await send_sms(
+            recipient.phone_number,
+            f"GHS {transfer.net_amount} has been delivered to your mobile money wallet.",
+        )
+    else:
+        # Failed or reversed: the money came back to the platform's Paystack
+        # balance, so hand it back to the recipient to re-claim with
+        # corrected details rather than leaving it marked as delivered.
+        logger.warning("Payout %s for wallet transfer %s: %s", reference, transfer.id, event)
+        transfer.status = TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO
+        await send_sms(
+            recipient.phone_number,
+            f"We couldn't deliver your GHS {transfer.net_amount} transfer to your mobile money wallet. "
+            f"Open the app to check your payout details and claim it again.",
+        )
+
+    session.add(transfer)
+    await session.commit()
+    await session.refresh(transfer)
+    return transfer
+
+
+async def reconcile_transfer(session: AsyncSession, transfer: WalletTransfer) -> None:
+    """Ask Paystack directly for whatever this transfer is waiting on, for when
+    the webhook is late, lost, or can't reach this server (e.g. local dev).
+    Funnels into the same handlers the webhook uses, so their row locks and
+    status checks make a poll racing a webhook harmless."""
+    if transfer.status == TransferStatus.PENDING_PAYMENT and transfer.payment_reference:
+        verified = await paystack.verify_transaction(transfer.payment_reference)
+        # Only act on a final charge state: "abandoned"/"ongoing"/"pending"
+        # checkouts can still be paid, so they must not be marked FAILED.
+        if verified.get("status") == "success":
+            await confirm_transfer_payment(session, transfer.payment_reference)
+        elif verified.get("status") == "failed":
+            locked = await _locked_transfer(session, WalletTransfer.id == transfer.id)
+            if locked is not None and locked.status == TransferStatus.PENDING_PAYMENT:
+                locked.status = TransferStatus.FAILED
+                session.add(locked)
+                await session.commit()
+    elif transfer.status == TransferStatus.PAYOUT_PENDING and transfer.payout_reference:
+        verified = await paystack.verify_transfer(transfer.payout_reference)
+        event = paystack.TRANSFER_FINAL_EVENTS.get(verified.get("status"))
+        if event:
+            await handle_payout_event(session, event, transfer.payout_reference)
+
+
+async def refresh_transfer(session: AsyncSession, transfer_id: uuid.UUID, user_id: uuid.UUID) -> WalletTransfer:
+    """Polled by the app while a transfer is in flight."""
+    transfer = await get_transfer(session, transfer_id)
+    if user_id not in (transfer.sender_id, transfer.recipient_id):
+        raise HTTPException(status_code=404, detail="Transfer not found")
+    try:
+        await reconcile_transfer(session, transfer)
+    except paystack.PaystackError as exc:
+        # e.g. an unknown/expired reference - report the current state rather
+        # than failing the poll.
+        logger.info("Refresh of wallet transfer %s: Paystack lookup failed: %s", transfer.id, exc)
+        await session.rollback()
     await session.refresh(transfer)
     return transfer
 

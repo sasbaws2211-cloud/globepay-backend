@@ -62,6 +62,15 @@ async def incoming_pending_claim(
     return await service.list_incoming_pending(session, current_user.id)
 
 
+@router.post("/transfers/{transfer_id}/refresh", response_model=TransferRead)
+async def refresh_transfer(
+    transfer_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await service.refresh_transfer(session, transfer_id, current_user.id)
+
+
 @router.post("/transfers/{transfer_id}/claim", response_model=TransferRead)
 async def claim_transfer(
     transfer_id: uuid.UUID,
@@ -69,5 +78,4 @@ async def claim_transfer(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    transfer = await service.get_transfer(session, transfer_id)
-    return await service.claim_transfer(session, transfer, current_user.id, payload)
+    return await service.claim_transfer(session, transfer_id, current_user.id, payload)

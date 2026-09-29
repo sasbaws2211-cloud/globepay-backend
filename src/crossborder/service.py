@@ -9,12 +9,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import User
 from src.common.kyc_limits import check_transaction_limit, record_transaction_volume
+from src.common.locking import locked_first
 from src.common.sms import send_sms
 from src.config import settings
 from src.crossborder import bitnob
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer
 from src.crossborder.schemas import CrossBorderInitiate
-from src.payments import paystack
+from src.payments import paystack, refunds
 
 MAX_DELIVERY_RETRIES = 3
 
@@ -124,11 +125,9 @@ async def _attempt_delivery(transfer: CrossBorderTransfer) -> None:
 
 
 async def confirm_transfer_payment(session: AsyncSession, reference: str) -> CrossBorderTransfer:
-    """Called from the Paystack webhook handler once the GHS payment succeeds."""
-    result = await session.exec(
-        select(CrossBorderTransfer).where(CrossBorderTransfer.payment_reference == reference)
-    )
-    transfer = result.first()
+    """Called from the Paystack webhook handler once the GHS payment succeeds,
+    and from the refresh/reconcile pollers - locked so delivery can't run twice."""
+    transfer = await locked_first(session, CrossBorderTransfer, CrossBorderTransfer.payment_reference == reference)
     if transfer is None:
         raise HTTPException(status_code=404, detail="Transfer not found")
 
@@ -180,30 +179,9 @@ async def retry_delivery(session: AsyncSession, transfer: CrossBorderTransfer) -
 
 
 async def refund_delivery_failure(session: AsyncSession, transfer: CrossBorderTransfer) -> CrossBorderTransfer:
-    if transfer.status != CrossBorderStatus.DELIVERY_FAILED:
-        raise HTTPException(
-            status_code=400, detail="Only a transfer stuck after payment (delivery_failed) can be refunded"
-        )
-
-    try:
-        refund = await paystack.refund_transaction(transfer.payment_reference, transfer.source_amount)
-    except paystack.PaystackError as e:
-        raise HTTPException(status_code=400, detail=f"Refund failed: {e}") from e
-
-    transfer.status = CrossBorderStatus.REFUNDED
-    transfer.refund_reference = str(refund.get("id", transfer.payment_reference))
-    transfer.refunded_at = datetime.now(timezone.utc)
-    session.add(transfer)
-    await session.commit()
-    await session.refresh(transfer)
-
-    sender = await session.get(User, transfer.sender_id)
-    await send_sms(
-        sender.phone_number,
-        f"Your cross-border transfer couldn't be delivered, so your GHS {transfer.source_amount} "
-        f"payment has been refunded.",
-    )
-    return transfer
+    """Moves the transfer to REFUND_PENDING; REFUNDED only once Paystack
+    reports the refund processed - see src/payments/refunds.py."""
+    return await refunds.start_refund(session, refunds.CROSSBORDER, transfer.id)
 
 
 async def get_transfer(session: AsyncSession, transfer_id: uuid.UUID, owner_id: uuid.UUID) -> CrossBorderTransfer:

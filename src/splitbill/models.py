@@ -16,7 +16,17 @@ class SplitBillStatus(StrEnum):
 
 class ShareStatus(StrEnum):
     PENDING = "pending"
-    PAID = "paid"
+    PAID = "paid"  # the participant's charge succeeded - says nothing about the organizer's payout
+
+
+class SharePayoutStatus(StrEnum):
+    """The organizer's payout for a PAID share, tracked separately so a
+    payout that fails or bounces can't hide behind the participant having paid."""
+
+    NOT_STARTED = "not_started"
+    PENDING = "pending"  # Paystack accepted the request; waiting on the transfer.* webhook
+    COMPLETED = "completed"
+    FAILED = "failed"  # organizer can retry via retry_share_payout
 
 
 class SplitBill(SQLModel, table=True):
@@ -54,6 +64,10 @@ class SplitBillShare(SQLModel, table=True):
     )
     payment_reference: str | None = Field(default=None, index=True)
     payout_reference: str | None = Field(default=None)
+    payout_status: SharePayoutStatus = Field(
+        default=SharePayoutStatus.NOT_STARTED,
+        sa_column=named_enum_column(SharePayoutStatus, "split_bill_share_payout_status"),
+    )
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=tz_aware_column())
     paid_at: datetime | None = Field(default=None, sa_column=tz_aware_column(nullable=True))

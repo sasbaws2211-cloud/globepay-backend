@@ -16,6 +16,9 @@ class CardStatus(StrEnum):
     TERMINATED = "terminated"
     FAILED = "failed"  # GHS payment itself failed - nothing was ever collected
     DELIVERY_FAILED = "delivery_failed"  # GHS payment succeeded but Bitnob card creation didn't - retry or refund
+    # Paystack accepted the refund but hasn't paid it out yet; refund.processed
+    # moves it to REFUNDED, refund.failed back to DELIVERY_FAILED (see payments/refunds.py).
+    REFUND_PENDING = "refund_pending"
     REFUNDED = "refunded"  # DELIVERY_FAILED resolved by refunding the GHS payment instead of retrying
 
 
@@ -24,6 +27,7 @@ class FundingStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"  # GHS payment itself failed - nothing was ever collected
     DELIVERY_FAILED = "delivery_failed"  # GHS payment succeeded but the Bitnob top-up didn't - retry or refund
+    REFUND_PENDING = "refund_pending"  # see CardStatus.REFUND_PENDING
     REFUNDED = "refunded"
 
 

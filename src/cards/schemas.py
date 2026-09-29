@@ -34,6 +34,19 @@ class CardRead(BaseModel):
     updated_at: datetime
 
 
+class CardLimitsRead(BaseModel):
+    """Everything the app shows before a card is paid for (see service.get_card_limits)."""
+
+    card_type: str  # always "lite" - the only type this app issues
+    can_top_up: bool  # always False for lite cards: funded once, at creation
+    min_load_ghs: Decimal
+    max_load_ghs: Decimal
+    min_load_usd: Decimal
+    max_load_usd: Decimal
+    max_cards_per_phone: int
+    creation_fee_usd: Decimal  # Bitnob's fee, charged to the platform wallet, not the card
+
+
 class CardFundingCreate(BaseModel):
     amount_ghs: Decimal
     sender_email: str

@@ -8,6 +8,7 @@ from src.cards import service as card_service
 from src.config import settings
 from src.crossborder import service as crossborder_service
 from src.db.main import get_session
+from src.payments import refunds
 from src.splitbill import service as splitbill_service
 from src.vaults import service as vault_service
 from src.wallet import service as wallet_service
@@ -51,5 +52,19 @@ async def paystack_webhook(request: Request, session: AsyncSession = Depends(get
             await card_service.confirm_card_payment(session, reference)
         elif metadata.get("type") == "card_funding":
             await card_service.confirm_card_funding(session, reference)
+
+    elif event in ("transfer.success", "transfer.failed", "transfer.reversed"):
+        # Outbound payouts carry no metadata, so route by reference prefix.
+        reference = data.get("reference") or ""
+        if reference.startswith(wallet_service.PAYOUT_REFERENCE_PREFIX):
+            await wallet_service.handle_payout_event(session, event, reference)
+        elif reference.startswith(vault_service.VAULT_PAYOUT_REFERENCE_PREFIX):
+            await vault_service.handle_payout_event(session, event, reference)
+        elif reference.startswith(splitbill_service.SPLIT_PAYOUT_REFERENCE_PREFIX):
+            await splitbill_service.handle_payout_event(session, event, reference)
+
+    elif event in ("refund.processed", "refund.failed"):
+        # A refund only counts as done once Paystack actually pays it out.
+        await refunds.handle_refund_webhook(session, event, data)
 
     return {"received": True}

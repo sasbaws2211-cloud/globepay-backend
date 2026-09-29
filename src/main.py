@@ -8,6 +8,7 @@ from src.admin.routes import router as admin_router
 from src.auth.routes import router as auth_router
 from src.cards.routes import router as cards_router
 from src.crossborder.routes import router as crossborder_router
+from src.payments.refresh_routes import router as payment_refresh_router
 from src.payments.routes import router as payments_router
 from src.splitbill.routes import router as splitbill_router
 from src.vaults.routes import router as vaults_router
@@ -43,6 +44,7 @@ app.include_router(splitbill_router)
 app.include_router(crossborder_router)
 app.include_router(cards_router)
 app.include_router(payments_router)
+app.include_router(payment_refresh_router)
 app.include_router(admin_router)
 
 

@@ -10,7 +10,7 @@ from src.admin.schemas import AdminUserDetail, AuditLogEntry, PlatformStats, Stu
 from src.auth.models import KycStatus, KycTier, User
 from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer
-from src.vaults.models import Vault, VaultWithdrawal
+from src.vaults.models import Vault, VaultWithdrawal, WithdrawalStatus
 from src.wallet.models import TransferStatus, WalletTransfer
 
 
@@ -244,11 +244,23 @@ async def get_platform_stats(session: AsyncSession) -> PlatformStats:
     # (already-confirmed-paid balance), but a WalletTransfer row is created
     # up front, before the sender's charge is even confirmed - counting
     # every row there would count fees on money that was never collected.
-    vault_fees: Decimal = (await session.exec(select(func.coalesce(func.sum(VaultWithdrawal.platform_fee), 0)))).one()
+    # A FAILED withdrawal's payout bounced and its gross was restored to the
+    # vault, so its fee was never realized.
+    vault_fees: Decimal = (
+        await session.exec(
+            select(func.coalesce(func.sum(VaultWithdrawal.platform_fee), 0)).where(
+                VaultWithdrawal.status != WithdrawalStatus.FAILED
+            )
+        )
+    ).one()
     wallet_fees: Decimal = (
         await session.exec(
             select(func.coalesce(func.sum(WalletTransfer.platform_fee), 0)).where(
-                WalletTransfer.status.in_([TransferStatus.COMPLETED, TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO])
+                WalletTransfer.status.in_([
+                    TransferStatus.COMPLETED,
+                    TransferStatus.AWAITING_RECIPIENT_PAYOUT_INFO,
+                    TransferStatus.PAYOUT_PENDING,
+                ])
             )
         )
     ).one()

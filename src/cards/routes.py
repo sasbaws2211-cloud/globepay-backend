@@ -14,6 +14,7 @@ from src.cards.schemas import (
     CardFundingCreate,
     CardFundingRead,
     CardFundingResponse,
+    CardLimitsRead,
     CardRead,
     CardTerminate,
 )
@@ -45,6 +46,12 @@ async def my_cards(
     session: AsyncSession = Depends(get_session),
 ):
     return await service.list_my_cards(session, current_user.id)
+
+
+# Declared before /{card_id} so "limits" isn't parsed as a card id.
+@router.get("/limits", response_model=CardLimitsRead)
+async def card_limits(current_user: User = Depends(get_current_user)):
+    return service.get_card_limits()
 
 
 @router.get("/{card_id}", response_model=CardRead)
