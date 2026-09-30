@@ -35,12 +35,17 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import KycTier, User
 from src.common.db_types import tz_aware_column
+from src.config import settings
 
-# (rolling 24-hour limit, rolling 30-day limit), GHS.
-TIER_LIMITS: dict[KycTier, tuple[Decimal, Decimal]] = {
+# (rolling 24-hour limit, rolling 30-day limit), GHS. None = no limit.
+# PHONE_VERIFIED's daily figure is Paystack's maximum single transfer in Ghana
+# (GHS 50,000 - https://support.paystack.com/hc/en-us/articles/360012276559);
+# Paystack publishes no daily or monthly cap, so there's no monthly one here.
+# Set 2026-09-30 (previously 5,000 / 20,000, ID_VERIFIED 20,000 / 100,000).
+TIER_LIMITS: dict[KycTier, tuple[Decimal | None, Decimal | None]] = {
     KycTier.UNVERIFIED: (Decimal("500"), Decimal("2000")),
-    KycTier.PHONE_VERIFIED: (Decimal("5000"), Decimal("20000")),
-    KycTier.ID_VERIFIED: (Decimal("20000"), Decimal("100000")),
+    KycTier.PHONE_VERIFIED: (Decimal("50000"), None),
+    KycTier.ID_VERIFIED: (None, None),
 }
 
 # An unpaid checkout counts against the limit for this long, then it's
@@ -113,27 +118,35 @@ async def _in_flight_volume(session: AsyncSession, user_id: uuid.UUID, since: da
     return total
 
 
-def limits_for(user: User) -> tuple[Decimal, Decimal]:
+def limits_for(user: User) -> tuple[Decimal | None, Decimal | None]:
     return TIER_LIMITS[user.kyc_tier]
 
 
 async def check_transaction_limit(session: AsyncSession, user: User, amount: Decimal) -> None:
     """Refuse (400) a payment that would take the user over their tier's
-    24-hour or 30-day limit. Call before creating the checkout."""
+    24-hour or 30-day limit. Call before creating the checkout. A no-op while
+    settings.ENFORCE_TRANSACTION_LIMITS is off (recording carries on)."""
+    if not settings.ENFORCE_TRANSACTION_LIMITS:
+        return
     daily_limit, monthly_limit = limits_for(user)
+    if daily_limit is None and monthly_limit is None:
+        return  # this tier has no limits
     now = datetime.now(timezone.utc)
     next_tier_hint = "phone number" if user.kyc_tier == KycTier.UNVERIFIED else "ID"
 
     amount = amount + await _in_flight_volume(session, user.id, now - IN_FLIGHT_WINDOW)
 
-    daily_total = await _confirmed_volume_since(session, user.id, now - timedelta(hours=24))
-    if daily_total + amount > daily_limit:
-        raise HTTPException(
-            status_code=400,
-            detail=f"This would exceed your daily transaction limit of GHS {daily_limit} for your verification "
-            f"level (payments you've started but not finished count too). Verify your {next_tier_hint} to raise it.",
-        )
+    if daily_limit is not None:
+        daily_total = await _confirmed_volume_since(session, user.id, now - timedelta(hours=24))
+        if daily_total + amount > daily_limit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"This would exceed your daily transaction limit of GHS {daily_limit} for your verification "
+                f"level (payments you've started but not finished count too). Verify your {next_tier_hint} to raise it.",
+            )
 
+    if monthly_limit is None:
+        return
     monthly_total = await _confirmed_volume_since(session, user.id, now - timedelta(days=30))
     if monthly_total + amount > monthly_limit:
         raise HTTPException(
@@ -159,11 +172,13 @@ async def limits_summary(session: AsyncSession, user: User) -> dict:
     daily_used = await _confirmed_volume_since(session, user.id, now - timedelta(hours=24)) + in_flight
     monthly_used = await _confirmed_volume_since(session, user.id, now - timedelta(days=30)) + in_flight
     return {
+        "enforced": settings.ENFORCE_TRANSACTION_LIMITS,
         "kyc_tier": user.kyc_tier,
+        # A limit (and its remaining) is None when the tier has no limit there.
         "daily_limit": daily_limit,
         "daily_used": daily_used,
-        "daily_remaining": max(daily_limit - daily_used, Decimal("0")),
+        "daily_remaining": None if daily_limit is None else max(daily_limit - daily_used, Decimal("0")),
         "monthly_limit": monthly_limit,
         "monthly_used": monthly_used,
-        "monthly_remaining": max(monthly_limit - monthly_used, Decimal("0")),
+        "monthly_remaining": None if monthly_limit is None else max(monthly_limit - monthly_used, Decimal("0")),
     }

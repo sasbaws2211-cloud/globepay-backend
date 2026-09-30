@@ -1,8 +1,8 @@
 """all_tables
 
-Revision ID: 1bf02dd5cedb
+Revision ID: e72623e43bf8
 Revises: 
-Create Date: 2026-09-30 01:41:10.065023
+Create Date: 2026-09-30 12:38:26.446458
 
 """
 from typing import Sequence, Union
@@ -16,7 +16,7 @@ import sqlmodel  # SQLModel column types (e.g. sqlmodel.sql.sqltypes.AutoString)
 
 
 # revision identifiers, used by Alembic.
-revision: str = '1bf02dd5cedb'
+revision: str = 'e72623e43bf8'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -32,6 +32,7 @@ def upgrade() -> None:
     sa.Column('hashed_password', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('is_active', sa.Boolean(), nullable=False),
     sa.Column('is_phone_verified', sa.Boolean(), nullable=False),
+    sa.Column('kyc_tier', sa.Enum('UNVERIFIED', 'PHONE_VERIFIED', 'ID_VERIFIED', name='kyc_tier'), nullable=False),
     sa.Column('token_version', sa.Integer(), nullable=False),
     sa.Column('is_admin', sa.Boolean(), nullable=False),
     sa.Column('closed_at', sa.DateTime(timezone=True), nullable=True),
@@ -70,20 +71,6 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_admin_audit_logs_admin_user_id'), 'admin_audit_logs', ['admin_user_id'], unique=False)
     op.create_index(op.f('ix_admin_audit_logs_target_id'), 'admin_audit_logs', ['target_id'], unique=False)
-    op.create_table('card_kyc',
-    sa.Column('id', sa.Uuid(), nullable=False),
-    sa.Column('user_id', sa.Uuid(), nullable=False),
-    sa.Column('bitnob_customer_id', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('status', sa.Enum('INITIATED', 'PENDING', 'APPROVED', 'REJECTED', name='card_kyc_status'), nullable=False),
-    sa.Column('completion_link', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('rejection_details', sa.JSON(), nullable=True),
-    sa.Column('submitted_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_card_kyc_bitnob_customer_id'), 'card_kyc', ['bitnob_customer_id'], unique=False)
-    op.create_index(op.f('ix_card_kyc_user_id'), 'card_kyc', ['user_id'], unique=True)
     op.create_table('crossborder_transfers',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('sender_id', sa.Uuid(), nullable=False),
@@ -142,12 +129,23 @@ def upgrade() -> None:
     sa.Column('organizer_id', sa.Uuid(), nullable=False),
     sa.Column('title', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('total_amount', sa.Numeric(precision=14, scale=2), nullable=False),
-    sa.Column('status', sa.Enum('OPEN', 'SETTLED', 'CANCELLED', name='split_bill_status'), nullable=False),
+    sa.Column('status', sa.Enum('OPEN', 'SETTLED', 'CANCELLED', 'WITHDRAWN', name='split_bill_status'), nullable=False),
+    sa.Column('collects_funds', sa.Boolean(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['organizer_id'], ['users.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_split_bills_organizer_id'), 'split_bills', ['organizer_id'], unique=False)
+    op.create_table('transaction_volume_logs',
+    sa.Column('id', sa.Uuid(), nullable=False),
+    sa.Column('user_id', sa.Uuid(), nullable=False),
+    sa.Column('amount', sa.Numeric(precision=14, scale=2), nullable=False),
+    sa.Column('source', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_transaction_volume_logs_user_id'), 'transaction_volume_logs', ['user_id'], unique=False)
     op.create_table('vaults',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('owner_id', sa.Uuid(), nullable=False),
@@ -178,7 +176,6 @@ def upgrade() -> None:
     sa.Column('card_brand', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('balance', sa.Numeric(precision=10, scale=2), nullable=False),
     sa.Column('currency', sqlmodel.sql.sqltypes.AutoString(length=3), nullable=False),
-    sa.Column('card_type', sa.Enum('LITE', 'STANDARD', name='virtual_card_type'), nullable=False),
     sa.Column('initial_funding_ghs', sa.Numeric(precision=14, scale=2), nullable=False),
     sa.Column('fee_ghs', sa.Numeric(precision=14, scale=2), nullable=False),
     sa.Column('payment_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
@@ -246,42 +243,6 @@ def upgrade() -> None:
     op.create_index(op.f('ix_card_events_card_id'), 'card_events', ['card_id'], unique=False)
     op.create_index(op.f('ix_card_events_event_id'), 'card_events', ['event_id'], unique=False)
     op.create_index(op.f('ix_card_events_event_type'), 'card_events', ['event_type'], unique=False)
-    op.create_table('card_fundings',
-    sa.Column('id', sa.Uuid(), nullable=False),
-    sa.Column('card_id', sa.Uuid(), nullable=False),
-    sa.Column('amount_ghs', sa.Numeric(precision=14, scale=2), nullable=False),
-    sa.Column('amount_usd', sa.Numeric(precision=10, scale=2), nullable=False),
-    sa.Column('fee_ghs', sa.Numeric(precision=14, scale=2), nullable=False),
-    sa.Column('status', sa.Enum('PENDING_PAYMENT', 'COMPLETED', 'FAILED', 'DELIVERY_FAILED', 'PROCESSING', 'REFUND_PENDING', 'REFUNDED', name='card_funding_status'), nullable=False),
-    sa.Column('payment_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('failure_reason', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('retry_count', sa.Integer(), nullable=False),
-    sa.Column('refund_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('refunded_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['card_id'], ['virtual_cards.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_card_fundings_card_id'), 'card_fundings', ['card_id'], unique=False)
-    op.create_index(op.f('ix_card_fundings_payment_reference'), 'card_fundings', ['payment_reference'], unique=False)
-    op.create_table('card_withdrawals',
-    sa.Column('id', sa.Uuid(), nullable=False),
-    sa.Column('card_id', sa.Uuid(), nullable=False),
-    sa.Column('amount_usd', sa.Numeric(precision=10, scale=2), nullable=False),
-    sa.Column('amount_ghs', sa.Numeric(precision=14, scale=2), nullable=False),
-    sa.Column('status', sa.Enum('CARD_PENDING', 'CARD_FAILED', 'PAYOUT_PENDING', 'PAYOUT_FAILED', 'COMPLETED', name='card_withdrawal_status'), nullable=False),
-    sa.Column('bitnob_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
-    sa.Column('payout_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('payout_attempts', sa.Integer(), nullable=False),
-    sa.Column('failure_reason', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['card_id'], ['virtual_cards.id'], ),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_card_withdrawals_bitnob_reference'), 'card_withdrawals', ['bitnob_reference'], unique=False)
-    op.create_index(op.f('ix_card_withdrawals_card_id'), 'card_withdrawals', ['card_id'], unique=False)
-    op.create_index(op.f('ix_card_withdrawals_payout_reference'), 'card_withdrawals', ['payout_reference'], unique=False)
     op.create_table('split_bill_shares',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('split_bill_id', sa.Uuid(), nullable=False),
@@ -289,10 +250,11 @@ def upgrade() -> None:
     sa.Column('gross_amount', sa.Numeric(precision=14, scale=2), nullable=False),
     sa.Column('platform_fee', sa.Numeric(precision=14, scale=2), nullable=False),
     sa.Column('net_amount', sa.Numeric(precision=14, scale=2), nullable=False),
-    sa.Column('status', sa.Enum('PENDING', 'PAID', name='split_bill_share_status'), nullable=False),
+    sa.Column('status', sa.Enum('PENDING', 'PAID', 'CANCELLED', name='split_bill_share_status'), nullable=False),
     sa.Column('payment_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('payout_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('payout_status', sa.Enum('NOT_STARTED', 'PENDING', 'COMPLETED', 'FAILED', name='split_bill_share_payout_status'), nullable=False),
+    sa.Column('refund_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('paid_at', sa.DateTime(timezone=True), nullable=True),
     sa.ForeignKeyConstraint(['split_bill_id'], ['split_bills.id'], ),
@@ -302,6 +264,25 @@ def upgrade() -> None:
     op.create_index(op.f('ix_split_bill_shares_payment_reference'), 'split_bill_shares', ['payment_reference'], unique=False)
     op.create_index(op.f('ix_split_bill_shares_split_bill_id'), 'split_bill_shares', ['split_bill_id'], unique=False)
     op.create_index(op.f('ix_split_bill_shares_user_id'), 'split_bill_shares', ['user_id'], unique=False)
+    op.create_table('split_bill_withdrawals',
+    sa.Column('id', sa.Uuid(), nullable=False),
+    sa.Column('split_bill_id', sa.Uuid(), nullable=False),
+    sa.Column('destination', sa.Enum('MOMO', 'VAULT', name='split_withdrawal_destination'), nullable=False),
+    sa.Column('vault_id', sa.Uuid(), nullable=True),
+    sa.Column('amount', sa.Numeric(precision=14, scale=2), nullable=False),
+    sa.Column('fee', sa.Numeric(precision=14, scale=2), nullable=False),
+    sa.Column('status', sa.Enum('PENDING', 'COMPLETED', 'FAILED', name='split_withdrawal_status'), nullable=False),
+    sa.Column('payout_reference', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
+    sa.Column('attempts', sa.Integer(), nullable=False),
+    sa.Column('failure_reason', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['split_bill_id'], ['split_bills.id'], ),
+    sa.ForeignKeyConstraint(['vault_id'], ['vaults.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_split_bill_withdrawals_payout_reference'), 'split_bill_withdrawals', ['payout_reference'], unique=False)
+    op.create_index(op.f('ix_split_bill_withdrawals_split_bill_id'), 'split_bill_withdrawals', ['split_bill_id'], unique=True)
     op.create_table('vault_contributions',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('vault_id', sa.Uuid(), nullable=False),
@@ -338,17 +319,13 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_vault_contributions_vault_id'), table_name='vault_contributions')
     op.drop_index(op.f('ix_vault_contributions_payment_reference'), table_name='vault_contributions')
     op.drop_table('vault_contributions')
+    op.drop_index(op.f('ix_split_bill_withdrawals_split_bill_id'), table_name='split_bill_withdrawals')
+    op.drop_index(op.f('ix_split_bill_withdrawals_payout_reference'), table_name='split_bill_withdrawals')
+    op.drop_table('split_bill_withdrawals')
     op.drop_index(op.f('ix_split_bill_shares_user_id'), table_name='split_bill_shares')
     op.drop_index(op.f('ix_split_bill_shares_split_bill_id'), table_name='split_bill_shares')
     op.drop_index(op.f('ix_split_bill_shares_payment_reference'), table_name='split_bill_shares')
     op.drop_table('split_bill_shares')
-    op.drop_index(op.f('ix_card_withdrawals_payout_reference'), table_name='card_withdrawals')
-    op.drop_index(op.f('ix_card_withdrawals_card_id'), table_name='card_withdrawals')
-    op.drop_index(op.f('ix_card_withdrawals_bitnob_reference'), table_name='card_withdrawals')
-    op.drop_table('card_withdrawals')
-    op.drop_index(op.f('ix_card_fundings_payment_reference'), table_name='card_fundings')
-    op.drop_index(op.f('ix_card_fundings_card_id'), table_name='card_fundings')
-    op.drop_table('card_fundings')
     op.drop_index(op.f('ix_card_events_event_type'), table_name='card_events')
     op.drop_index(op.f('ix_card_events_event_id'), table_name='card_events')
     op.drop_index(op.f('ix_card_events_card_id'), table_name='card_events')
@@ -364,6 +341,8 @@ def downgrade() -> None:
     op.drop_table('virtual_cards')
     op.drop_index(op.f('ix_vaults_owner_id'), table_name='vaults')
     op.drop_table('vaults')
+    op.drop_index(op.f('ix_transaction_volume_logs_user_id'), table_name='transaction_volume_logs')
+    op.drop_table('transaction_volume_logs')
     op.drop_index(op.f('ix_split_bills_organizer_id'), table_name='split_bills')
     op.drop_table('split_bills')
     op.drop_index(op.f('ix_otps_user_id'), table_name='otps')
@@ -373,9 +352,6 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_crossborder_transfers_sender_id'), table_name='crossborder_transfers')
     op.drop_index(op.f('ix_crossborder_transfers_payment_reference'), table_name='crossborder_transfers')
     op.drop_table('crossborder_transfers')
-    op.drop_index(op.f('ix_card_kyc_user_id'), table_name='card_kyc')
-    op.drop_index(op.f('ix_card_kyc_bitnob_customer_id'), table_name='card_kyc')
-    op.drop_table('card_kyc')
     op.drop_index(op.f('ix_admin_audit_logs_target_id'), table_name='admin_audit_logs')
     op.drop_index(op.f('ix_admin_audit_logs_admin_user_id'), table_name='admin_audit_logs')
     op.drop_table('admin_audit_logs')

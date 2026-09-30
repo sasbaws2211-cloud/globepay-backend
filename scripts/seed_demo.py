@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlmodel.ext.asyncio.session import AsyncSession  # noqa: E402
 
-from src.auth.models import ReferralRewardStatus, User  # noqa: E402
+from src.auth.models import KycTier, ReferralRewardStatus, User  # noqa: E402
 from src.auth.utils import hash_password  # noqa: E402
 from src.cards.models import CardStatus, VirtualCard  # noqa: E402
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer  # noqa: E402
@@ -63,6 +63,7 @@ async def seed() -> None:
                 email="ama.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
+                kyc_tier=KycTier.PHONE_VERIFIED,  # verified phone -> matching limits tier
                 referral_code="AMA2026",
                 referral_reward_status=ReferralRewardStatus.REWARDED,
                 default_momo_number="+233240000001",
@@ -76,6 +77,7 @@ async def seed() -> None:
                 email="kojo.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
+                kyc_tier=KycTier.PHONE_VERIFIED,  # verified phone -> matching limits tier
                 referral_code="KOJO2026",
                 referral_reward_status=ReferralRewardStatus.NONE,
                 default_momo_number="+233240000002",
@@ -89,6 +91,7 @@ async def seed() -> None:
                 email="efua.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
+                kyc_tier=KycTier.PHONE_VERIFIED,  # verified phone -> matching limits tier
                 referral_code="EFUA2026",
                 referral_reward_status=ReferralRewardStatus.PENDING,
                 default_momo_number="+233240000003",
@@ -213,9 +216,10 @@ async def seed() -> None:
                 platform_fee=Decimal("3.00"),
                 net_amount=Decimal("117.00"),
                 note="Birthday contribution",
-                status=TransferStatus.PENDING_PAYMENT,
+                status=TransferStatus.COMPLETED,
                 payment_reference="demo_transfer_pending",
                 created_at=NOW - timedelta(hours=4),
+                completed_at=NOW - timedelta(hours=4),
             ),
         ]
         for transfer in transfers:
@@ -276,8 +280,8 @@ async def seed() -> None:
         await add_if_missing(session, bill, "split bill")
         for name, user_id, amount, status in [
             ("ama", ama.id, Decimal("300.00"), ShareStatus.PAID),
-            ("kojo", kojo.id, Decimal("300.00"), ShareStatus.PENDING),
-            ("efua", efua.id, Decimal("300.00"), ShareStatus.PENDING),
+            ("kojo", kojo.id, Decimal("300.00"), ShareStatus.PAID),
+            ("efua", efua.id, Decimal("300.00"), ShareStatus.PAID),
         ]:
             await add_if_missing(
                 session,

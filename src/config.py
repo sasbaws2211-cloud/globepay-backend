@@ -29,7 +29,11 @@ class Settings(BaseSettings):
     USMS_BASE_URL: str = "https://webapp.usmsgh.com"
     USMS_SENDER_ID: str = ""
     USMS_TOKEN: str = ""
-
+    # Per-KYC-tier daily/monthly payment limits (common/kyc_limits.py). On
+    # (re-enabled 2026-09-30). Set to false to stop refusing payments - they're
+    # still recorded in the volume ledger either way, so switching back on
+    # applies the limits with correct history straight away.
+    ENFORCE_TRANSACTION_LIMITS: bool = True
 
 
 settings = Settings()

@@ -38,13 +38,14 @@ class TransactionLimitsRead(BaseModel):
     """The user's verification tier, its limits, and what's used so far
     (confirmed payments plus checkouts started in the last 30 minutes)."""
 
+    enforced: bool = False  # settings.ENFORCE_TRANSACTION_LIMITS - when False nothing is refused
     kyc_tier: KycTier
-    daily_limit: Decimal
+    daily_limit: Decimal | None  # None = no daily limit for this tier
     daily_used: Decimal
-    daily_remaining: Decimal
-    monthly_limit: Decimal
+    daily_remaining: Decimal | None
+    monthly_limit: Decimal | None  # None = no monthly limit for this tier
     monthly_used: Decimal
-    monthly_remaining: Decimal
+    monthly_remaining: Decimal | None
 
 
 class ReferredUserRead(BaseModel):
