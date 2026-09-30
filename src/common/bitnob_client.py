@@ -95,10 +95,19 @@ async def request(method: str, path: str, json_body: dict | None = None) -> dict
     payload = _json.dumps(json_body, separators=(",", ":")) if json_body is not None else ""
     headers = _headers(payload)
 
-    async with httpx.AsyncClient(base_url=BASE_URL) as client:
-        resp = await client.request(method, path, content=payload if json_body is not None else None, headers=headers)
+    # Network failures (confirmed live: intermittent ConnectTimeouts) and
+    # non-JSON bodies become BitnobError, which callers already handle -
+    # otherwise they escaped as raw httpx errors and surfaced as 500s.
+    try:
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=30) as client:
+            resp = await client.request(method, path, content=payload if json_body is not None else None, headers=headers)
+    except httpx.HTTPError as e:
+        raise BitnobError(f"Couldn't reach Bitnob ({type(e).__name__})") from e
 
     if resp.status_code >= 400:
         raise BitnobError(f"Bitnob API error ({resp.status_code})", resp.text)
 
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError as e:
+        raise BitnobError("Bitnob returned an unreadable response", resp.text) from e

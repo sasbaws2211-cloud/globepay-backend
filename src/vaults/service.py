@@ -10,7 +10,7 @@ from sqlmodel import func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import ReferralRewardStatus, User
-from src.common.kyc_limits import check_transaction_limit, record_transaction_volume
+from src.common import kyc_limits
 from src.common.locking import locked_first
 from src.common.sms import send_sms
 from src.config import settings
@@ -51,6 +51,36 @@ async def create_vault(session: AsyncSession, owner_id: uuid.UUID, data: VaultCr
 async def list_user_vaults(session: AsyncSession, owner_id: uuid.UUID) -> list[Vault]:
     result = await session.exec(select(Vault).where(Vault.owner_id == owner_id))
     return list(result.all())
+
+
+async def list_user_vaults_read(session: AsyncSession, owner_id: uuid.UUID) -> list[dict]:
+    """list_user_vaults plus each vault's latest withdrawal status."""
+    vaults = await list_user_vaults(session, owner_id)
+    latest: dict[uuid.UUID, WithdrawalStatus] = {}
+    if vaults:
+        rows = (
+            await session.exec(
+                select(VaultWithdrawal.vault_id, VaultWithdrawal.status)
+                .where(VaultWithdrawal.vault_id.in_([v.id for v in vaults]))
+                .order_by(VaultWithdrawal.created_at.asc())
+            )
+        ).all()
+        for vault_id, status in rows:  # ascending, so the last one wins
+            latest[vault_id] = status
+    return [
+        {**v.model_dump(), "last_withdrawal_status": latest.get(v.id), **withdrawal_quote(v.balance)} for v in vaults
+    ]
+
+
+def _withdrawal_fee(gross: Decimal) -> Decimal:
+    return (gross * Decimal(settings.PLATFORM_WITHDRAWAL_FEE_PERCENT) / Decimal(100)).quantize(Decimal("0.01"))
+
+
+def withdrawal_quote(balance: Decimal) -> dict:
+    """Fee and payout for withdrawing the whole balance - the same sum
+    request_withdrawal charges, so what the app shows is what's sent."""
+    fee = _withdrawal_fee(balance)
+    return {"withdrawal_fee": fee, "withdrawal_net": balance - fee}
 
 
 async def get_owned_vault(session: AsyncSession, vault_id: uuid.UUID, owner_id: uuid.UUID) -> Vault:
@@ -195,7 +225,7 @@ async def initiate_contribution(
         raise HTTPException(status_code=400, detail=f"Cannot contribute to a '{vault.status}' vault")
 
     owner = await session.get(User, vault.owner_id)
-    await check_transaction_limit(session, owner, amount)
+    await kyc_limits.check_transaction_limit(session, owner, amount)
 
     reference = f"vault-{vault.id}-{uuid.uuid4().hex[:10]}"
     contribution = VaultContribution(
@@ -204,12 +234,20 @@ async def initiate_contribution(
     session.add(contribution)
     await session.commit()
 
-    data = await paystack.initialize_transaction(
-        email=email,
-        amount=amount,
-        reference=reference,
-        metadata={"vault_id": str(vault.id), "type": "vault_contribution"},
-    )
+    try:
+        data = await paystack.initialize_transaction(
+            email=email,
+            amount=amount,
+            reference=reference,
+            metadata={"vault_id": str(vault.id), "type": "vault_contribution"},
+        )
+    except paystack.PaystackError as e:
+        # No checkout exists, so don't leave a "pending" contribution behind
+        # (it would count against the user's limit as an unpaid checkout).
+        contribution.status = ContributionStatus.FAILED
+        session.add(contribution)
+        await session.commit()
+        raise HTTPException(status_code=502, detail=f"Couldn't start the payment: {e}") from e
     return {"authorization_url": data["authorization_url"], "reference": reference}
 
 
@@ -230,8 +268,9 @@ async def _credit_confirmed_contribution(session: AsyncSession, contribution: Va
         vault.status = VaultStatus.MATURED
     vault.updated_at = datetime.now(timezone.utc)
     session.add(vault)
+    # Real money in (a one-off or scheduled charge) - counts toward the limits.
+    kyc_limits.record_transaction_volume(session, vault.owner_id, contribution.amount, "vault_contribution")
 
-    record_transaction_volume(session, vault.owner_id, contribution.amount, "vault_contribution")
     await _maybe_reward_referral(session, vault.owner_id)
     return vault
 
@@ -299,9 +338,7 @@ async def request_withdrawal(
         raise HTTPException(status_code=400, detail="Nothing to withdraw")
 
     gross = vault.balance
-    fee = (gross * Decimal(settings.PLATFORM_WITHDRAWAL_FEE_PERCENT) / Decimal(100)).quantize(
-        Decimal("0.01")
-    )
+    fee = _withdrawal_fee(gross)
     net = gross - fee
 
     withdrawal = VaultWithdrawal(
@@ -490,10 +527,11 @@ async def run_recurring_charge(session: AsyncSession, vault: Vault) -> None:
         await session.commit()
         return
 
+    # A scheduled charge counts toward the limits like any other payment in.
     try:
-        await check_transaction_limit(session, owner, vault.contribution_amount)
-    except HTTPException as e:
-        await _fail(str(e.detail))
+        await kyc_limits.check_transaction_limit(session, owner, vault.contribution_amount)
+    except HTTPException:
+        await _fail("over your transaction limit")
         session.add(vault)
         await session.commit()
         return
@@ -570,9 +608,14 @@ async def generate_vault_statement_csv(session: AsyncSession, vault: Vault) -> s
 
     entries = [
         (c.paid_at, "Contribution", c.amount, c.payment_reference or "") for c in contributions_result.all()
-    ] + [
-        (w.created_at, "Withdrawal", -w.net_amount, w.payout_reference or "") for w in withdrawals_result.all()
     ]
+    # A withdrawal empties the vault by its GROSS amount: the net goes to the
+    # owner's MoMo and the fee to the platform. Listing only -net left the
+    # running balance ending at the fee (e.g. 0.25) instead of 0.
+    for w in withdrawals_result.all():
+        entries.append((w.created_at, "Withdrawal", -w.net_amount, w.payout_reference or ""))
+        if w.platform_fee:
+            entries.append((w.created_at, "Withdrawal fee", -w.platform_fee, w.payout_reference or ""))
     entries.sort(key=lambda row: row[0])
 
     buffer = io.StringIO()

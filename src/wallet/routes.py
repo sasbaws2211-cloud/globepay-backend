@@ -8,7 +8,15 @@ from src.auth.models import User
 from src.common.idempotency import run_idempotently
 from src.db.main import get_session
 from src.wallet import service
-from src.wallet.schemas import TransferClaim, TransferInitiate, TransferInitiateResponse, TransferRead, WalletSummary
+from src.wallet.schemas import (
+    TransferClaim,
+    TransferInitiate,
+    TransferInitiateResponse,
+    TransferQuote,
+    TransferQuoteRequest,
+    TransferRead,
+    WalletSummary,
+)
 
 router = APIRouter(prefix="/wallet", tags=["wallet"])
 
@@ -46,12 +54,23 @@ async def send_money(
     return await _handler()
 
 
+@router.post("/transfers/quote", response_model=TransferQuote)
+async def quote_transfer(
+    payload: TransferQuoteRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Review step before paying - creates nothing, charges nothing."""
+    return await service.quote_transfer(session, current_user, payload.recipient_phone_number, payload.amount)
+
+
 @router.get("/transfers", response_model=list[TransferRead])
 async def my_transfers(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    return await service.list_my_transfers(session, current_user.id)
+    transfers = await service.list_my_transfers(session, current_user.id)
+    return [await service.to_read(session, t, current_user.id) for t in transfers]
 
 
 @router.get("/transfers/pending-claim", response_model=list[TransferRead])
@@ -59,7 +78,8 @@ async def incoming_pending_claim(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    return await service.list_incoming_pending(session, current_user.id)
+    transfers = await service.list_incoming_pending(session, current_user.id)
+    return [await service.to_read(session, t, current_user.id) for t in transfers]
 
 
 @router.post("/transfers/{transfer_id}/refresh", response_model=TransferRead)
@@ -68,7 +88,12 @@ async def refresh_transfer(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    return await service.refresh_transfer(session, transfer_id, current_user.id)
+    # Read the id up front: refresh_transfer rolls the session back when
+    # Paystack doesn't know the reference, which expires current_user too, and
+    # touching an expired attribute in async code raises (MissingGreenlet -> 500).
+    user_id = current_user.id
+    transfer = await service.refresh_transfer(session, transfer_id, user_id)
+    return await service.to_read(session, transfer, user_id)
 
 
 @router.post("/transfers/{transfer_id}/claim", response_model=TransferRead)
@@ -78,4 +103,5 @@ async def claim_transfer(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    return await service.claim_transfer(session, transfer_id, current_user.id, payload)
+    transfer = await service.claim_transfer(session, transfer_id, current_user.id, payload)
+    return await service.to_read(session, transfer, current_user.id)

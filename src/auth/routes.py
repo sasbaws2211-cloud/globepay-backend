@@ -6,7 +6,6 @@ from src.auth.dependencies import get_current_user
 from src.auth.models import User
 from src.auth.schemas import (
     AccountClosureRequest,
-    KycIdSubmit,
     PasswordResetConfirm,
     PasswordResetRequest,
     PayoutDestinationSet,
@@ -14,11 +13,13 @@ from src.auth.schemas import (
     ReferredUserRead,
     RoundUpSettingsSet,
     Token,
+    TransactionLimitsRead,
     UserCreate,
     UserLogin,
     UserRead,
 )
 from src.auth.utils import create_access_token, verify_password
+from src.common import kyc_limits
 from src.common.rate_limit import check_rate_limit
 from src.db.main import get_session
 from src.vaults.models import Vault
@@ -107,15 +108,6 @@ async def confirm_phone_verification(
     return await service.confirm_phone_verification(session, current_user, payload.code)
 
 
-@router.post("/kyc/submit-id", response_model=UserRead)
-async def submit_kyc_id(
-    payload: KycIdSubmit,
-    current_user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-):
-    return await service.submit_kyc_id(session, current_user, payload.ghana_card_number)
-
-
 @router.post("/me/close-account", status_code=status.HTTP_204_NO_CONTENT)
 async def close_account(
     payload: AccountClosureRequest,
@@ -130,6 +122,12 @@ async def close_account(
 @router.get("/me", response_model=UserRead)
 async def read_current_user(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.get("/me/limits", response_model=TransactionLimitsRead)
+async def my_limits(current_user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Verification tier, its daily/monthly limits and what's been used."""
+    return await kyc_limits.limits_summary(session, current_user)
 
 
 @router.get("/me/referrals", response_model=list[ReferredUserRead])

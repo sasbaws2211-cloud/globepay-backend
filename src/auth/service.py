@@ -8,9 +8,10 @@ from fastapi import HTTPException
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from src.auth.models import KycStatus, KycTier, Otp, OtpPurpose, ReferralRewardStatus, User
+from src.auth.models import KycTier, Otp, OtpPurpose, ReferralRewardStatus, User
 from src.auth.schemas import UserCreate
 from src.auth.utils import hash_password
+from src.common.phone import normalize_gh_phone, phone_lookup_variants
 from src.common.sms import send_sms
 from src.vaults.models import RecurringStatus, Vault
 
@@ -19,7 +20,10 @@ MAX_OTP_ATTEMPTS = 5
 
 
 async def get_user_by_phone(session: AsyncSession, phone_number: str) -> User | None:
-    result = await session.exec(select(User).where(User.phone_number == phone_number))
+    """Matches any spelling of the number ("0244...", "+233244...", ...) -
+    see src/common/phone.py. Used by login, password reset, registration's
+    duplicate check, wallet transfers and split bills."""
+    result = await session.exec(select(User).where(User.phone_number.in_(phone_lookup_variants(phone_number))))
     return result.first()
 
 
@@ -43,7 +47,7 @@ async def create_user(session: AsyncSession, user_data: UserCreate) -> User:
             raise HTTPException(status_code=400, detail="Invalid referral code")
 
     user = User(
-        phone_number=user_data.phone_number,
+        phone_number=normalize_gh_phone(user_data.phone_number),
         full_name=user_data.full_name,
         email=user_data.email,
         hashed_password=hash_password(user_data.password),
@@ -159,28 +163,10 @@ async def confirm_phone_verification(session: AsyncSession, user: User, code: st
     await _consume_otp(session, user, OtpPurpose.PHONE_VERIFICATION, code)
 
     user.is_phone_verified = True
+    # Verifying the phone raises the transaction limits (common/kyc_limits.py);
+    # never lowers an ID-verified user.
     if user.kyc_tier == KycTier.UNVERIFIED:
         user.kyc_tier = KycTier.PHONE_VERIFIED
-    user.updated_at = datetime.now(timezone.utc)
-    session.add(user)
-    await session.commit()
-    await session.refresh(user)
-    return user
-
-
-async def submit_kyc_id(session: AsyncSession, user: User, ghana_card_number: str) -> User:
-    """Self-submission only - see KycStatus/ghana_card_number on User for
-    why this never auto-approves. An admin must review it (src/admin/)."""
-    if user.kyc_tier == KycTier.UNVERIFIED:
-        raise HTTPException(status_code=400, detail="Verify your phone number before submitting an ID")
-    if user.kyc_status == KycStatus.PENDING:
-        raise HTTPException(status_code=400, detail="An ID submission is already pending review")
-    if user.kyc_status == KycStatus.APPROVED:
-        raise HTTPException(status_code=400, detail="Your ID is already verified")
-
-    user.ghana_card_number = ghana_card_number
-    user.kyc_status = KycStatus.PENDING
-    user.kyc_rejection_reason = None
     user.updated_at = datetime.now(timezone.utc)
     session.add(user)
     await session.commit()
@@ -193,7 +179,7 @@ async def close_account(session: AsyncSession, user: User) -> None:
     is not a real regulated fintech, but modeling one honestly means a
     closed account's identity should stay linked to its transaction
     history for whatever AML retention period would apply, not be erased
-    on request. phone_number, kyc_tier/kyc_status, and every
+    on request. phone_number and every
     contribution/transfer/audit row are left untouched. What does get
     cleared is data with no such retention reason: contact details, the
     saved card, payout destination, and the submitted Ghana Card number.
@@ -217,7 +203,6 @@ async def close_account(session: AsyncSession, user: User) -> None:
     user.default_momo_number = None
     user.default_momo_bank_code = None
     user.default_account_name = None
-    user.ghana_card_number = None
     user.round_up_vault_id = None
     user.is_active = False
     user.closed_at = datetime.now(timezone.utc)

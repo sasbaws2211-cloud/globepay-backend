@@ -19,6 +19,9 @@ internal UUID `id`, not the `quote_id` string used everywhere else) is
 needed to observe the real outcome.
 """
 
+from decimal import Decimal
+
+from src.common import bitnob_balance
 from src.common.bitnob_client import BitnobError, request  # noqa: F401 - re-exported for callers
 
 BASE_URL = "https://api.bitnob.com"  # kept for backwards-compat readability; see bitnob_client for the real one
@@ -61,6 +64,14 @@ async def initialize_payout(quote_id: str, reference: str, payment_reason: str, 
 
 async def finalize_payout(quote_id: str) -> dict:
     return await request("POST", f"/api/payouts/{quote_id}/finalize")
+
+
+async def available_balance(asset: str) -> Decimal | None:
+    """The company account's spendable balance in `asset` (e.g. USDC) - the
+    float every offchain payout is debited from. None if it can't be told
+    right now: Bitnob reports 0 for minutes after every debit, see
+    src/common/bitnob_balance.py."""
+    return await bitnob_balance.available_balance(asset)
 
 
 async def get_payout(bitnob_id: str) -> dict:

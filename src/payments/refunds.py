@@ -1,8 +1,8 @@
 """Tracking Paystack refunds through to their real outcome.
 
 Paystack refunds are asynchronous: POST /refund only acknowledges the
-request. Each refundable record (virtual card creation, card top-up,
-cross-border transfer) therefore goes DELIVERY_FAILED -> REFUND_PENDING when
+request. Each refundable record (virtual card creation, cross-border
+transfer) therefore goes DELIVERY_FAILED -> REFUND_PENDING when
 the refund is requested, and only reaches REFUNDED when Paystack reports it
 processed - via the refund.processed webhook or the reconcile sweep polling
 GET /refund/{id}. A failed refund goes back to DELIVERY_FAILED so the user
@@ -21,7 +21,7 @@ from sqlmodel import SQLModel, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import User
-from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard
+from src.cards.models import CardStatus, VirtualCard
 from src.common.locking import locked_first
 from src.common.sms import send_sms
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer
@@ -31,11 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 async def _card_owner(session: AsyncSession, card: VirtualCard) -> User:
-    return await session.get(User, card.user_id)
-
-
-async def _funding_owner(session: AsyncSession, funding: CardFunding) -> User:
-    card = await session.get(VirtualCard, funding.card_id)
     return await session.get(User, card.user_id)
 
 
@@ -50,19 +45,17 @@ class RefundKind:
     refundable: Any  # DELIVERY_FAILED - the only state a refund can start from
     pending: Any  # REFUND_PENDING
     refunded: Any  # REFUNDED
-    amount_field: str  # the GHS amount charged, refunded in full
+    amount_field: str  # the GHS amount charged (incl. any passed-on fee), refunded in full
     what: str  # user-facing noun for SMS
     owner: Callable[[AsyncSession, Any], Awaitable[User]]
 
 
 CARD_CREATION = RefundKind("card_creation", VirtualCard, CardStatus.DELIVERY_FAILED, CardStatus.REFUND_PENDING,
-                           CardStatus.REFUNDED, "initial_funding_ghs", "virtual card", _card_owner)
-CARD_FUNDING = RefundKind("card_funding", CardFunding, FundingStatus.DELIVERY_FAILED, FundingStatus.REFUND_PENDING,
-                          FundingStatus.REFUNDED, "amount_ghs", "card top-up", _funding_owner)
+                           CardStatus.REFUNDED, "charged_ghs", "virtual card", _card_owner)
 CROSSBORDER = RefundKind("crossborder_transfer", CrossBorderTransfer, CrossBorderStatus.DELIVERY_FAILED,
                          CrossBorderStatus.REFUND_PENDING, CrossBorderStatus.REFUNDED, "source_amount",
                          "cross-border transfer", _crossborder_owner)
-REFUND_KINDS = (CARD_CREATION, CARD_FUNDING, CROSSBORDER)
+REFUND_KINDS = (CARD_CREATION, CROSSBORDER)
 
 
 def _touch(row) -> None:

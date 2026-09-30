@@ -17,12 +17,19 @@ from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.cards import service as card_service
-from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard
+from src.cards import termination_payout
+from src.cards.models import CardStatus, TerminationPayoutStatus, VirtualCard
 from src.crossborder import service as crossborder_service
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer
 from src.payments import paystack, refunds
 from src.splitbill import service as splitbill_service
-from src.splitbill.models import SharePayoutStatus, ShareStatus, SplitBillShare
+from src.splitbill.models import (
+    SharePayoutStatus,
+    ShareStatus,
+    SplitBillShare,
+    SplitBillWithdrawal,
+    SplitWithdrawalStatus,
+)
 from src.vaults import service as vault_service
 from src.vaults.models import ContributionStatus, Vault, VaultContribution, VaultWithdrawal, WithdrawalStatus
 from src.wallet import service as wallet_service
@@ -50,10 +57,6 @@ async def _vault_owner(session: AsyncSession, contribution: VaultContribution) -
     return (await session.get(Vault, contribution.vault_id)).owner_id
 
 
-async def _card_owner(session: AsyncSession, funding: CardFunding) -> uuid.UUID:
-    return (await session.get(VirtualCard, funding.card_id)).user_id
-
-
 def _owner_field(attr: str) -> Callable[[AsyncSession, Any], Awaitable[uuid.UUID]]:
     async def get(_session: AsyncSession, row) -> uuid.UUID:
         return getattr(row, attr)
@@ -69,8 +72,6 @@ CHARGE_KINDS: list[ChargeKind] = [
                crossborder_service.confirm_transfer_payment, _owner_field("sender_id")),
     ChargeKind("card_creation", VirtualCard, CardStatus.PENDING_PAYMENT,
                card_service.confirm_card_payment, _owner_field("user_id")),
-    ChargeKind("card_funding", CardFunding, FundingStatus.PENDING_PAYMENT,
-               card_service.confirm_card_funding, _card_owner),
 ]
 
 
@@ -185,6 +186,23 @@ async def sweep_in_flight_payments(session: AsyncSession) -> int:
 
     changed += await refunds.sweep_pending_refunds(session)
 
+    # Cross-border payouts Bitnob hadn't settled when delivery ran.
+    processing = (
+        await session.exec(
+            select(CrossBorderTransfer.id).where(
+                CrossBorderTransfer.status == CrossBorderStatus.PROCESSING,
+                CrossBorderTransfer.bitnob_id.is_not(None),
+                CrossBorderTransfer.created_at >= now - PAYOUT_POLL_WINDOW,
+            )
+        )
+    ).all()
+    for transfer_id in processing:
+        try:
+            changed += await crossborder_service.reconcile_processing(session, transfer_id)
+        except Exception:
+            logger.exception("Reconcile failed for cross-border transfer %s", transfer_id)
+            await session.rollback()
+
     withdrawals = (
         await session.exec(
             select(VaultWithdrawal.id, VaultWithdrawal.payout_reference).where(
@@ -221,6 +239,46 @@ async def sweep_in_flight_payments(session: AsyncSession) -> int:
                 changed += 1
         except Exception:
             logger.exception("Reconcile failed for split-bill share %s", share_id)
+            await session.rollback()
+
+    # Split-bill withdrawals to the organizer's mobile money.
+    split_withdrawals = (
+        await session.exec(
+            select(SplitBillWithdrawal.id, SplitBillWithdrawal.payout_reference).where(
+                SplitBillWithdrawal.status == SplitWithdrawalStatus.PENDING,
+                SplitBillWithdrawal.payout_reference.is_not(None),
+                SplitBillWithdrawal.updated_at >= now - PAYOUT_POLL_WINDOW,
+            )
+        )
+    ).all()
+    for withdrawal_id, reference in split_withdrawals:
+        try:
+            event = await _final_payout_event(reference)
+            if event:
+                await splitbill_service.handle_withdrawal_payout_event(session, event, reference)
+                changed += 1
+        except Exception:
+            logger.exception("Reconcile failed for split-bill withdrawal %s", withdrawal_id)
+            await session.rollback()
+
+    # Terminated cards' leftover balances being paid to their owners.
+    card_payouts = (
+        await session.exec(
+            select(VirtualCard.id, VirtualCard.termination_payout_reference).where(
+                VirtualCard.termination_payout_status == TerminationPayoutStatus.PENDING,
+                VirtualCard.termination_payout_reference.is_not(None),
+                VirtualCard.updated_at >= now - PAYOUT_POLL_WINDOW,
+            )
+        )
+    ).all()
+    for card_id, reference in card_payouts:
+        try:
+            event = await _final_payout_event(reference)
+            if event:
+                await termination_payout.handle_payout_event(session, event, reference)
+                changed += 1
+        except Exception:
+            logger.exception("Reconcile failed for card termination payout %s", card_id)
             await session.rollback()
 
     return changed

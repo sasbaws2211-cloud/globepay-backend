@@ -1,10 +1,13 @@
 import hashlib
 import hmac
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.cards import service as card_service
+from src.cards import termination_payout
+from src.cards import webhooks as card_webhooks
 from src.config import settings
 from src.crossborder import service as crossborder_service
 from src.db.main import get_session
@@ -50,8 +53,6 @@ async def paystack_webhook(request: Request, session: AsyncSession = Depends(get
             await crossborder_service.confirm_transfer_payment(session, reference)
         elif metadata.get("type") == "card_creation":
             await card_service.confirm_card_payment(session, reference)
-        elif metadata.get("type") == "card_funding":
-            await card_service.confirm_card_funding(session, reference)
 
     elif event in ("transfer.success", "transfer.failed", "transfer.reversed"):
         # Outbound payouts carry no metadata, so route by reference prefix.
@@ -62,9 +63,28 @@ async def paystack_webhook(request: Request, session: AsyncSession = Depends(get
             await vault_service.handle_payout_event(session, event, reference)
         elif reference.startswith(splitbill_service.SPLIT_PAYOUT_REFERENCE_PREFIX):
             await splitbill_service.handle_payout_event(session, event, reference)
+        elif reference.startswith(splitbill_service.SPLIT_WITHDRAWAL_REFERENCE_PREFIX):
+            await splitbill_service.handle_withdrawal_payout_event(session, event, reference)
+        elif reference.startswith(termination_payout.PAYOUT_REFERENCE_PREFIX):
+            await termination_payout.handle_payout_event(session, event, reference)
 
     elif event in ("refund.processed", "refund.failed"):
         # A refund only counts as done once Paystack actually pays it out.
         await refunds.handle_refund_webhook(session, event, data)
 
     return {"received": True}
+
+
+@router.post("/bitnob")
+async def bitnob_webhook(request: Request, session: AsyncSession = Depends(get_session)):
+    """Bitnob virtual-card events (purchases, declines, terminations...).
+    Set this URL as the callback in the Bitnob dashboard."""
+    raw_body = await request.body()
+    if not card_webhooks.verify_signature(raw_body, request.headers.get("x-bitnob-signature")):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from e
+    outcome = await card_webhooks.handle_bitnob_webhook(session, raw_body, payload if isinstance(payload, dict) else {})
+    return {"received": True, "outcome": outcome}

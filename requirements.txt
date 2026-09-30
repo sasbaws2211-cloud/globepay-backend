@@ -21,3 +21,4 @@ APScheduler==3.11.0
 
 pytest==8.3.4
 pytest-asyncio==0.25.2
+cryptography==50.0.1

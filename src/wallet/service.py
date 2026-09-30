@@ -9,7 +9,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import User
 from src.auth.service import get_user_by_phone
-from src.common.kyc_limits import check_transaction_limit, record_transaction_volume
+from src.common import kyc_limits
 from src.common.roundup import compute_roundup
 from src.common.sms import send_sms
 from src.config import settings
@@ -27,6 +27,73 @@ async def get_transfer(session: AsyncSession, transfer_id: uuid.UUID) -> WalletT
     return transfer
 
 
+def mask_phone(phone: str) -> str:
+    """"+233200000002" -> "+233 20 *** 0002" - enough to confirm, not to harvest."""
+    if len(phone) >= 8:
+        return f"{phone[:4]} {phone[4:6]} *** {phone[-4:]}" if phone.startswith("+") else f"{phone[:3]} *** {phone[-4:]}"
+    return phone
+
+
+def _short_name(full_name: str) -> str:
+    """"Kojo Owusu" -> "Kojo O." - confirms the recipient without exposing a full name."""
+    parts = full_name.split()
+    return f"{parts[0]} {parts[-1][0]}." if len(parts) > 1 else full_name
+
+
+async def _resolve_recipient(session: AsyncSession, sender: User, recipient_phone_number: str) -> User:
+    recipient = await get_user_by_phone(session, recipient_phone_number)
+    # A suspended or self-closed account can't log in to claim, so money sent
+    # there would be stranded - treat it exactly like an unknown number
+    # (same message, so this doesn't reveal the account's state).
+    if recipient is None or not recipient.is_active or recipient.closed_at is not None:
+        raise HTTPException(status_code=404, detail="No user found with that phone number")
+    if recipient.id == sender.id:
+        raise HTTPException(status_code=400, detail="Cannot send money to yourself")
+    return recipient
+
+
+def _amounts(sender: User, amount: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    """(fee, net, roundup) - one place, so the preview can't disagree with the charge."""
+    fee = (amount * Decimal(settings.PLATFORM_WITHDRAWAL_FEE_PERCENT) / Decimal(100)).quantize(Decimal("0.01"))
+    roundup = Decimal("0.00")
+    if sender.round_up_vault_id is not None:
+        roundup = compute_roundup(amount, sender.round_up_denomination)
+    return fee, amount - fee, roundup
+
+
+async def quote_transfer(session: AsyncSession, sender: User, recipient_phone_number: str, amount: Decimal) -> dict:
+    """The review step before paying: who it's going to, the fee, what they
+    get, the round-up and the total charge. Runs the same checks as
+    initiate_transfer so a quote that passes can be paid."""
+    recipient = await _resolve_recipient(session, sender, recipient_phone_number)
+    fee, net, roundup = _amounts(sender, amount)
+    await kyc_limits.check_transaction_limit(session, sender, amount + roundup)
+    return {
+        "recipient_name": _short_name(recipient.full_name),
+        "recipient_phone": mask_phone(recipient.phone_number),
+        "amount": amount,
+        "platform_fee": fee,
+        "recipient_gets": net,
+        "roundup_amount": roundup,
+        "total_charge": amount + roundup,
+    }
+
+
+async def to_read(session: AsyncSession, transfer: WalletTransfer, viewer_id: uuid.UUID) -> dict:
+    """TransferRead fields plus the viewer-relative ones the history needs."""
+    sent = transfer.sender_id == viewer_id
+    other = await session.get(User, transfer.recipient_id if sent else transfer.sender_id)
+    return {
+        **transfer.model_dump(),
+        "direction": "sent" if sent else "received",
+        "counterparty_name": other.full_name if other else None,
+        "counterparty_phone": mask_phone(other.phone_number) if other else None,
+        "pay_url": transfer.authorization_url
+        if sent and transfer.status == TransferStatus.PENDING_PAYMENT
+        else None,
+    }
+
+
 async def initiate_transfer(
     session: AsyncSession,
     sender: User,
@@ -35,22 +102,10 @@ async def initiate_transfer(
     note: str | None,
     sender_email: str,
 ) -> dict:
-    recipient = await get_user_by_phone(session, recipient_phone_number)
-    if recipient is None:
-        raise HTTPException(status_code=404, detail="No user found with that phone number")
-    if recipient.id == sender.id:
-        raise HTTPException(status_code=400, detail="Cannot send money to yourself")
-
-    fee = (amount * Decimal(settings.PLATFORM_WITHDRAWAL_FEE_PERCENT) / Decimal(100)).quantize(
-        Decimal("0.01")
-    )
-    net = amount - fee
-
-    roundup = Decimal("0.00")
-    if sender.round_up_vault_id is not None:
-        roundup = compute_roundup(amount, sender.round_up_denomination)
-
-    await check_transaction_limit(session, sender, amount + roundup)
+    recipient = await _resolve_recipient(session, sender, recipient_phone_number)
+    fee, net, roundup = _amounts(sender, amount)
+    # Before the checkout exists - the sender is charged the transfer plus their round-up.
+    await kyc_limits.check_transaction_limit(session, sender, amount + roundup)
 
     reference = f"wallet-{uuid.uuid4().hex[:14]}"
     transfer = WalletTransfer(
@@ -79,6 +134,9 @@ async def initiate_transfer(
         session.add(transfer)
         await session.commit()
         raise
+    transfer.authorization_url = data["authorization_url"]
+    session.add(transfer)
+    await session.commit()
     return {"authorization_url": data["authorization_url"], "reference": reference, "transfer_id": str(transfer.id)}
 
 
@@ -142,12 +200,11 @@ async def confirm_transfer_payment(session: AsyncSession, reference: str) -> Wal
         return transfer
 
     sender = await session.get(User, transfer.sender_id)
-    if transfer.roundup_amount > 0 and sender.round_up_vault_id is not None:
-        await credit_roundup(session, sender.round_up_vault_id, transfer.roundup_amount, f"{reference}-roundup")
-
-    record_transaction_volume(
+    kyc_limits.record_transaction_volume(
         session, sender.id, transfer.gross_amount + transfer.roundup_amount, "wallet_transfer"
     )
+    if transfer.roundup_amount > 0 and sender.round_up_vault_id is not None:
+        await credit_roundup(session, sender.round_up_vault_id, transfer.roundup_amount, f"{reference}-roundup")
 
     recipient = await session.get(User, transfer.recipient_id)
 

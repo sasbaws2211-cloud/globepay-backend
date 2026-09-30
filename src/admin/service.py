@@ -7,8 +7,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.admin.models import AdminAuditLog
 from src.admin.schemas import AdminUserDetail, AuditLogEntry, PlatformStats, StuckTransaction
-from src.auth.models import KycStatus, KycTier, User
-from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard
+from src.auth.models import KycTier, User
+from src.cards.models import CardStatus, VirtualCard
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer
 from src.vaults.models import Vault, VaultWithdrawal, WithdrawalStatus
 from src.wallet.models import TransferStatus, WalletTransfer
@@ -90,6 +90,7 @@ async def get_user_detail(session: AsyncSession, user_id: uuid.UUID) -> AdminUse
         email=user.email,
         is_active=user.is_active,
         is_admin=user.is_admin,
+        kyc_tier=user.kyc_tier,
         created_at=user.created_at,
         vault_count=vault_count,
         total_vault_balance=total_vault_balance,
@@ -107,41 +108,19 @@ async def set_user_active_status(session: AsyncSession, user_id: uuid.UUID, is_a
     return user
 
 
-async def list_pending_kyc(session: AsyncSession) -> list[User]:
-    result = await session.exec(
-        select(User).where(User.kyc_status == KycStatus.PENDING).order_by(User.updated_at.asc())
-    )
-    return list(result.all())
-
-
-async def approve_kyc(session: AsyncSession, user_id: uuid.UUID) -> User:
+async def set_user_kyc_tier(session: AsyncSession, user_id: uuid.UUID, tier: KycTier) -> tuple[User, KycTier]:
+    """Change a user's verification tier (and so their transaction limits).
+    ID_VERIFIED is only reachable this way - there's no self-service ID check.
+    Returns the user and their previous tier, for the audit log."""
     user = await session.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.kyc_status != KycStatus.PENDING:
-        raise HTTPException(status_code=400, detail="No pending ID submission for this user")
-
-    user.kyc_status = KycStatus.APPROVED
-    user.kyc_tier = KycTier.ID_VERIFIED
+    previous = user.kyc_tier
+    user.kyc_tier = tier
     session.add(user)
     await session.commit()
     await session.refresh(user)
-    return user
-
-
-async def reject_kyc(session: AsyncSession, user_id: uuid.UUID, reason: str) -> User:
-    user = await session.get(User, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user.kyc_status != KycStatus.PENDING:
-        raise HTTPException(status_code=400, detail="No pending ID submission for this user")
-
-    user.kyc_status = KycStatus.REJECTED
-    user.kyc_rejection_reason = reason
-    session.add(user)
-    await session.commit()
-    await session.refresh(user)
-    return user
+    return user, previous
 
 
 async def get_crossborder_transfer(session: AsyncSession, transfer_id: uuid.UUID) -> CrossBorderTransfer:
@@ -156,13 +135,6 @@ async def get_card(session: AsyncSession, card_id: uuid.UUID) -> VirtualCard:
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")
     return card
-
-
-async def get_card_funding(session: AsyncSession, funding_id: uuid.UUID) -> CardFunding:
-    funding = await session.get(CardFunding, funding_id)
-    if funding is None:
-        raise HTTPException(status_code=404, detail="Card funding not found")
-    return funding
 
 
 async def list_stuck_transactions(session: AsyncSession) -> list[StuckTransaction]:
@@ -206,26 +178,6 @@ async def list_stuck_transactions(session: AsyncSession) -> list[StuckTransactio
                 failure_reason=card.failure_reason,
                 retry_count=card.retry_count,
                 created_at=card.created_at,
-            )
-        )
-
-    funding_result = await session.exec(
-        select(CardFunding).where(CardFunding.status == FundingStatus.DELIVERY_FAILED)
-    )
-    for funding in funding_result.all():
-        card = await session.get(VirtualCard, funding.card_id)
-        user = await session.get(User, card.user_id)
-        items.append(
-            StuckTransaction(
-                kind="card_funding",
-                id=funding.id,
-                user_id=card.user_id,
-                user_phone=user.phone_number,
-                amount=funding.amount_ghs,
-                status=funding.status.value,
-                failure_reason=funding.failure_reason,
-                retry_count=funding.retry_count,
-                created_at=funding.created_at,
             )
         )
 

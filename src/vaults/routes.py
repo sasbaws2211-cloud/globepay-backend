@@ -34,7 +34,7 @@ async def list_vaults(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    return await service.list_user_vaults(session, current_user.id)
+    return await service.list_user_vaults_read(session, current_user.id)
 
 
 @router.get("/{vault_id}", response_model=VaultRead)

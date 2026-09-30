@@ -11,7 +11,7 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 class ChargeRefreshRead(BaseModel):
-    kind: str  # vault_contribution | splitbill_share | crossborder_transfer | card_creation | card_funding
+    kind: str  # vault_contribution | splitbill_share | crossborder_transfer | card_creation
     status: str
     pending: bool  # true while Paystack still hasn't reported a final charge state
 

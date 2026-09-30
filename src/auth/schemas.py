@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, EmailStr
 
-from src.auth.models import KycStatus, KycTier, ReferralRewardStatus
+from src.auth.models import KycTier, ReferralRewardStatus
 
 
 class UserCreate(BaseModel):
@@ -21,15 +21,30 @@ class UserRead(BaseModel):
     full_name: str
     email: str | None
     is_phone_verified: bool
-    kyc_tier: KycTier
-    kyc_status: KycStatus
-    kyc_rejection_reason: str | None
+    kyc_tier: KycTier = KycTier.UNVERIFIED  # sets the transaction limits - see GET /auth/me/limits
     referral_code: str
     referral_reward_status: ReferralRewardStatus
     default_momo_number: str | None
     default_momo_bank_code: str | None
+    default_account_name: str | None = None  # the saved payout's account name, to prefill withdrawals
     round_up_vault_id: uuid.UUID | None
     round_up_denomination: Decimal
+    # A reusable card from an earlier card payment - needed for auto-contribute.
+    has_saved_card: bool = False
+    paystack_card_last4: str | None = None
+
+
+class TransactionLimitsRead(BaseModel):
+    """The user's verification tier, its limits, and what's used so far
+    (confirmed payments plus checkouts started in the last 30 minutes)."""
+
+    kyc_tier: KycTier
+    daily_limit: Decimal
+    daily_used: Decimal
+    daily_remaining: Decimal
+    monthly_limit: Decimal
+    monthly_used: Decimal
+    monthly_remaining: Decimal
 
 
 class ReferredUserRead(BaseModel):
@@ -71,10 +86,6 @@ class PasswordResetConfirm(BaseModel):
 
 class PhoneVerificationConfirm(BaseModel):
     code: str
-
-
-class KycIdSubmit(BaseModel):
-    ghana_card_number: str
 
 
 class AccountClosureRequest(BaseModel):

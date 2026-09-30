@@ -2,32 +2,37 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, field_validator
+from typing import Any
+
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from src.crossborder.models import CrossBorderStatus
 
 
-class BeneficiaryDetails(BaseModel):
-    destination_type: str = "mobile_money"  # mobile_money / bank
-    account_name: str
-    account_number: str  # phone number for mobile_money
-    network: str  # e.g. MPESA, MTN, AIRTEL - confirmed field name for mobile_money
-
-    @field_validator("network")
-    @classmethod
-    def _bitnob_network_code(cls, value: str) -> str:
-        # Bitnob only accepts bare uppercase codes - confirmed live: "M-Pesa"
-        # fails delivery with "network has an invalid value" *after* the
-        # sender has paid, so normalize the familiar spellings up front.
-        return "".join(ch for ch in value if ch.isalnum()).upper()
-
-
 class CrossBorderInitiate(BaseModel):
-    source_amount: Decimal  # GHS
-    destination_country: str  # ISO code, e.g. "KE"
-    destination_currency: str  # e.g. "KES"
-    beneficiary: BeneficiaryDetails
-    sender_email: str  # for the Paystack checkout
+    source_amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)  # GHS
+    destination_country: str = Field(pattern=r"^[A-Za-z]{2}$")  # ISO code, e.g. "KE"
+    destination_currency: str = Field(pattern=r"^[A-Za-z]{3}$")  # e.g. "KES"
+    # How the money is delivered - one of the corridor's destination types
+    # from Bitnob (mobile_money, bank, ach, wire, sepa_eur, domestic_gbp, swift...).
+    destination_type: str = Field(min_length=1, max_length=40)
+    # The fields Bitnob requires for that destination type (see
+    # GET /crossborder/corridors/{country}); validated in corridors.build_beneficiary
+    # against Bitnob's live schema, including nested `beneficiary` and `sender`.
+    beneficiary: dict[str, Any]
+    sender_email: EmailStr  # for the Paystack checkout
+    # Remember the sender block (address, date/country of birth) for next time.
+    save_sender_profile: bool = False
+
+    @field_validator("destination_country", "destination_currency")
+    @classmethod
+    def _upper(cls, value: str) -> str:
+        # Bitnob looks corridors up case-sensitively ("KE/ngn" was not found).
+        return value.upper()
+
+
+class SenderProfile(BaseModel):
+    sender: dict[str, Any] | None = None  # as last used in a transfer's `sender` block
 
 
 class CrossBorderInitiateResponse(BaseModel):
@@ -50,3 +55,8 @@ class CrossBorderRead(BaseModel):
     refunded_at: datetime | None
     created_at: datetime
     completed_at: datetime | None
+    # Filled by routes: how and to whom it was sent (account masked).
+    destination_type: str | None = None
+    beneficiary_name: str | None = None
+    beneficiary_bank: str | None = None
+    beneficiary_account: str | None = None

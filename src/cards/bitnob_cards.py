@@ -5,22 +5,18 @@ apply to every Bitnob integration in this codebase - same rule applies
 here: no live-mode path, ever, without a deliberate decision made
 outside this code.
 
-Endpoints confirmed from https://bitnob.dev/api-reference/virtual-cards
-and https://bitnob.dev/api-reference/customers:
-  1. create_customer - POST /api/customers (prerequisite: card issuance
-     needs a customer_id from this "Card KYC" step first)
-  2. create_card      - POST /api/cards
-  3. fund_card         - POST /api/cards/{card_id}/balance (type="fund")
-  4. set_card_status   - POST /api/cards/{card_id}/status ("frozen"/"active")
-  5. terminate_card    - DELETE /api/cards/{card_id} (blocked within 24h of creation)
-  6. get_card          - GET /api/cards/{card_id}
-  7. list_cards        - GET /api/cards
+GlobePay issues LITE cards only - no Card KYC, loaded once at creation,
+never topped up or withdrawn from. Endpoints used, from
+https://bitnob.dev/api-reference/virtual-cards and
+https://bitnob.dev/api-reference/customers:
+  1. create_lite_card      - POST /api/cards/lite (creates the customer too)
+  2. find_customer_by_phone - GET /api/customers?phone_number= (card cap)
+  3. set_card_status       - POST /api/cards/{card_id}/status ("frozen"/"active")
+  4. terminate_card        - DELETE /api/cards/{card_id} (blocked within 24h of creation)
+  5. get_card / get_card_secure / list_transactions
 
-Amounts are documented as "micro-units" - assumed 1 unit = 1,000,000
-micro-units (a common convention), NOT independently confirmed against
-a real response the way the payouts amount format was. Verify this
-against a real create_card/fund_card response before trusting it for
-anything beyond a demo.
+Amounts are "micro-units": 1 USD = 1,000,000 (confirmed on real card
+responses and transaction lists).
 """
 
 from decimal import Decimal
@@ -43,6 +39,12 @@ MAX_LITE_CARDS_PER_CUSTOMER = 3
 # company wallet (the card itself receives the full load - confirmed on a
 # real sandbox card's transactions).
 CARD_CREATION_FEE_USD = 1
+# Funding fee, charged on a lite card's one load at creation (confirmed live
+# 2026-09-29/30 against the balance and the card's own transaction list):
+# $1 under $100, else 1%.
+FUNDING_FEE_FLAT_USD = 1
+FUNDING_FEE_FLAT_BELOW_USD = 100
+FUNDING_FEE_PERCENT = 1
 
 
 def to_micro_units(amount: Decimal) -> int:
@@ -97,85 +99,6 @@ async def find_customer_by_phone(phone_number: str) -> dict | None:
     return customers[0] if customers else None
 
 
-async def create_customer(email: str, first_name: str, last_name: str, customer_type: str = "individual") -> dict:
-    """The cardholder name on a card is always taken from the customer
-    record (first_name/last_name), never from the card-creation request
-    itself - confirmed by a real 400 when a name was sent on create_card
-    instead ("the customer record has no name... a name sent on this
-    request is not used")."""
-    body = {
-        "email": email,
-        "customer_type": customer_type,
-        "first_name": first_name,
-        "last_name": last_name,
-    }
-    return await request("POST", "/api/customers", body)
-
-
-async def update_customer_kyc(
-    customer_id: str,
-    country: str,
-    date_of_birth: str,  # YYYY-MM-DD
-    id_type: str,
-    id_number: str,
-    dial_code: str,
-    phone_number: str,
-    line1: str,
-    city: str,
-    state: str,
-    postal_code: str,
-) -> dict:
-    """Card issuance fails with "KYC verification required (status=none)"
-    on a bare create_customer record - confirmed by a real 400. There's
-    no dedicated KYC-submission endpoint documented; PUT on the customer
-    with these fields is what the docs' field list for "customers
-    created with full KYC" implies is needed, not independently
-    confirmed as the exact mechanism that flips kyc_status - verify
-    against a real response before relying on this for anything beyond
-    a demo."""
-    body = {
-        "country": country,
-        "date_of_birth": date_of_birth,
-        "id_type": id_type,
-        "id_number": id_number,
-        "dial_code": dial_code,
-        "phone_number": phone_number,
-        "line1": line1,
-        "city": city,
-        "state": state,
-        "postal_code": postal_code,
-    }
-    return await request("PUT", f"/api/customers/{customer_id}", body)
-
-
-async def create_card(
-    customer_id: str, name: str, amount: Decimal, currency: str = "USD", card_brand: str = "visa"
-) -> dict:
-    """Contradictory live behavior, both confirmed by real errors: an
-    earlier attempt with no `name` field failed with "the customer
-    record has no name... a name sent on this request is not used" -
-    implying the customer's first_name/last_name should be enough. But
-    with a properly-named customer, omitting `name` here instead failed
-    with "Name is required" in a completely different error format. Both
-    are sent now (customer first_name/last_name AND this field) since
-    the live API's actual requirement doesn't match either error's
-    advisory text taken alone."""
-    body = {
-        "customer_id": customer_id,
-        "name": name,
-        "amount": to_micro_units(amount),
-        "currency": currency,
-        "card_type": "virtual",
-        "card_brand": card_brand,
-    }
-    return await request("POST", "/api/cards", body)
-
-
-async def fund_card(card_id: str, amount: Decimal, reference: str) -> dict:
-    body = {"amount": to_micro_units(amount), "type": "fund", "reference": reference}
-    return await request("POST", f"/api/cards/{card_id}/balance", body)
-
-
 async def set_card_status(card_id: str, status: str) -> dict:
     """status: 'frozen' or 'active'."""
     return await request("POST", f"/api/cards/{card_id}/status", {"status": status})
@@ -190,6 +113,14 @@ async def terminate_card(card_id: str, reason: str) -> dict:
 
 async def get_card(card_id: str) -> dict:
     return await request("GET", f"/api/cards/{card_id}")
+
+
+async def get_card_secure(card_id: str) -> dict:
+    """GET /api/cards/{card_id}/secure - full number/CVV/expiry, encrypted to
+    the public key registered in Bitnob's dashboard (see cards/secure_details.py).
+    Docs say 400 "no encryption key is registered" until that's done; the
+    sandbox actually returns them unencrypted under data.details instead."""
+    return await request("GET", f"/api/cards/{card_id}/secure")
 
 
 async def simulate_transaction(card_id: str, event_type: str) -> dict:

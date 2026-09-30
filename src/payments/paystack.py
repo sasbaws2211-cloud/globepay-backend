@@ -27,6 +27,21 @@ def _headers() -> dict[str, str]:
     }
 
 
+async def _send(method: str, path: str, json: dict | None = None, params: dict | None = None) -> dict:
+    """One place for the HTTP round trip. Network failures (confirmed live:
+    intermittent ConnectTimeouts) and non-JSON replies become PaystackError,
+    which every caller already handles - previously they escaped as raw
+    httpx exceptions and turned polls and webhooks into 500s."""
+    try:
+        async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL, timeout=30) as client:
+            resp = await client.request(method, path, json=json, params=params, headers=_headers())
+        return resp.json()
+    except httpx.HTTPError as e:
+        raise PaystackError(f"Couldn't reach Paystack ({type(e).__name__})") from e
+    except ValueError as e:
+        raise PaystackError("Paystack returned an unreadable response") from e
+
+
 def _to_subunit(amount: Decimal) -> int:
     """Paystack amounts are in the currency's smallest unit (pesewas for GHS)."""
     return int(amount * 100)
@@ -58,18 +73,14 @@ async def initialize_transaction(
         "reference": reference,
         "metadata": metadata or {},
     }
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.post("/transaction/initialize", json=payload, headers=_headers())
-    body = resp.json()
+    body = await _send("POST", "/transaction/initialize", json=payload)
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to initialize transaction"), body)
     return body["data"]
 
 
 async def verify_transaction(reference: str) -> dict:
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.get(f"/transaction/verify/{reference}", headers=_headers())
-    body = resp.json()
+    body = await _send("GET", f"/transaction/verify/{reference}")
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to verify transaction"), body)
     return body["data"]
@@ -88,9 +99,7 @@ async def create_transfer_recipient(
         "bank_code": bank_code,
         "currency": currency,
     }
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.post("/transferrecipient", json=payload, headers=_headers())
-    body = resp.json()
+    body = await _send("POST", "/transferrecipient", json=payload)
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to create transfer recipient"), body)
     return body["data"]["recipient_code"]
@@ -104,9 +113,7 @@ async def initiate_transfer(amount: Decimal, recipient_code: str, reason: str, r
         "reason": reason,
         "reference": reference,
     }
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.post("/transfer", json=payload, headers=_headers())
-    body = resp.json()
+    body = await _send("POST", "/transfer", json=payload)
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to initiate transfer"), body)
     return body["data"]
@@ -116,9 +123,7 @@ async def verify_transfer(reference: str) -> dict:
     """Current state of an outbound payout. data.status is one of
     pending / queued / processing / otp / success / failed / reversed -
     used to reconcile payouts whose transfer.* webhook never arrived."""
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.get(f"/transfer/verify/{reference}", headers=_headers())
-    body = resp.json()
+    body = await _send("GET", f"/transfer/verify/{reference}")
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to verify transfer"), body)
     return body["data"]
@@ -143,9 +148,7 @@ async def charge_authorization(authorization_code: str, email: str, amount: Deci
         "amount": _to_subunit(amount),
         "reference": reference,
     }
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.post("/transaction/charge_authorization", json=payload, headers=_headers())
-    body = resp.json()
+    body = await _send("POST", "/transaction/charge_authorization", json=payload)
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to charge saved authorization"), body)
     return body["data"]
@@ -160,9 +163,7 @@ async def refund_transaction(reference: str, amount: Decimal | None = None) -> d
     payload: dict[str, Any] = {"transaction": reference}
     if amount is not None:
         payload["amount"] = _to_subunit(amount)
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.post("/refund", json=payload, headers=_headers())
-    body = resp.json()
+    body = await _send("POST", "/refund", json=payload)
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to initiate refund"), body)
     return body["data"]
@@ -172,9 +173,7 @@ async def fetch_refund(refund_id: str) -> dict:
     """GET /refund/{id} - the refund's current state (confirmed live: a fresh
     refund reads "pending"). Paystack statuses: pending / processing /
     processed / failed (plus needs-attention, which isn't final)."""
-    async with httpx.AsyncClient(base_url=settings.PAYSTACK_BASE_URL) as client:
-        resp = await client.get(f"/refund/{refund_id}", headers=_headers())
-    body = resp.json()
+    body = await _send("GET", f"/refund/{refund_id}")
     if not body.get("status"):
         raise PaystackError(body.get("message", "Failed to fetch refund"), body)
     return body["data"]

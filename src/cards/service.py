@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -7,20 +8,21 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.auth.models import User
-from src.cards import bitnob_cards
-from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard
-from src.cards.schemas import CardCreate, CardFundingCreate, CardTerminate, CardTransactionRead
-from src.common.kyc_limits import check_transaction_limit, record_transaction_volume
+from src.cards import bitnob_cards, termination_payout
+from src.common import bitnob_balance, kyc_limits
+from src.cards.models import CardEvent, CardStatus, TerminationPayoutStatus, VirtualCard
+from src.cards.schemas import CardCreate, CardTerminate, CardTransactionRead
 from src.common.locking import locked_first
 from src.common.sms import send_sms
 from src.config import settings
 from src.payments import paystack, refunds
 
+logger = logging.getLogger(__name__)
+
 MIN_CARD_USD = Decimal("2.00")  # confirmed live: Bitnob rejects card creation below $2
-# Every card this app issues is a Bitnob *lite* card: loaded once, at
-# creation, up to this cap, and never topped up (see bitnob_cards).
-MAX_CARD_LOAD_USD = Decimal(bitnob_cards.LITE_MAX_LOAD_USD)
-MAX_TOPUP_USD = MAX_CARD_LOAD_USD  # kept for the (now always-refused) top-up path
+# Lite cards (the only type GlobePay issues): loaded once at creation, up to
+# this cap, never topped up.
+LITE_MAX_LOAD_USD = Decimal(bitnob_cards.LITE_MAX_LOAD_USD)
 MAX_DELIVERY_RETRIES = 3
 
 
@@ -32,19 +34,78 @@ def _usd_to_ghs(amount_usd: Decimal) -> Decimal:
     return (amount_usd * Decimal(str(settings.DEMO_GHS_USD_RATE))).quantize(Decimal("0.01"))
 
 
+def _bitnob_fees_usd(amount_usd: Decimal) -> Decimal:
+    """Bitnob's fees on a new card, debited from the company float and passed
+    on to the user (confirmed live 2026-09-29/30 against the balance and the
+    card's transaction list): the funding fee on its one load - $1 under
+    $100, else 1% - plus $1 for creating the card."""
+    if amount_usd < bitnob_cards.FUNDING_FEE_FLAT_BELOW_USD:
+        funding_fee = Decimal(bitnob_cards.FUNDING_FEE_FLAT_USD)
+    else:
+        funding_fee = (amount_usd * bitnob_cards.FUNDING_FEE_PERCENT / 100).quantize(Decimal("0.01"))
+    return funding_fee + Decimal(bitnob_cards.CARD_CREATION_FEE_USD)
+
+
+def price_load(amount_ghs: Decimal) -> dict:
+    """Validate a new card's one-time load against Bitnob's lite-card limits
+    and price it: what goes on the card, the passed-on fees, and the total
+    charged. Raises HTTPException(400) with a user-facing reason."""
+    amount_usd = _ghs_to_usd(amount_ghs)
+    min_ghs = _usd_to_ghs(MIN_CARD_USD) + Decimal("0.01")  # rounded up so it never converts to under $2
+    if amount_usd < MIN_CARD_USD:
+        raise HTTPException(status_code=400, detail=f"The minimum is GHS {min_ghs} (${MIN_CARD_USD})")
+    if amount_usd > LITE_MAX_LOAD_USD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A card can hold at most GHS {_usd_to_ghs(LITE_MAX_LOAD_USD)} (${LITE_MAX_LOAD_USD}), "
+            f"loaded once when it's created.",
+        )
+    fee_usd = _bitnob_fees_usd(amount_usd)
+    fee_ghs = _usd_to_ghs(fee_usd)
+    return {
+        "amount_ghs": amount_ghs,
+        "amount_usd": amount_usd,
+        "fee_ghs": fee_ghs,
+        "fee_usd": fee_usd,
+        "total_ghs": amount_ghs + fee_ghs,
+    }
+
+
+async def _ensure_float_covers(load_usd: Decimal, fee_usd: Decimal) -> None:
+    """Refuse BEFORE payment if our Bitnob float can't fund this load plus
+    Bitnob's fees - otherwise card creation fails after the user paid.
+    An unknown balance (Bitnob's post-debit 0, see common/bitnob_balance)
+    doesn't block; the paid-but-undelivered path (retry/refund) covers it."""
+    try:
+        available = await bitnob_balance.available_balance("USDC")
+    except bitnob_cards.BitnobError:
+        available = None
+    if available is not None and load_usd + fee_usd > available:
+        logger.warning("Bitnob float %s can't cover a card load of %s + fees %s", available, load_usd, fee_usd)
+        raise HTTPException(status_code=503, detail="Cards are temporarily unavailable - please try again later")
+
+
 def get_card_limits() -> dict:
     """What the app shows before someone pays - single source of truth so the
     UI can't drift from what the backend (and Bitnob) will accept."""
+    rate = Decimal(str(settings.DEMO_GHS_USD_RATE))
     return {
         "card_type": "lite",
         "can_top_up": False,
         # Round the GHS minimum up so the converted USD never lands a pesewa under $2.
-        "min_load_ghs": (_usd_to_ghs(MIN_CARD_USD) + Decimal("0.01")),
-        "max_load_ghs": _usd_to_ghs(MAX_CARD_LOAD_USD),
+        "min_load_ghs": _usd_to_ghs(MIN_CARD_USD) + Decimal("0.01"),
+        "max_load_ghs": _usd_to_ghs(LITE_MAX_LOAD_USD),
         "min_load_usd": MIN_CARD_USD,
-        "max_load_usd": MAX_CARD_LOAD_USD,
+        "max_load_usd": LITE_MAX_LOAD_USD,
         "max_cards_per_phone": bitnob_cards.MAX_LITE_CARDS_PER_CUSTOMER,
         "creation_fee_usd": Decimal(bitnob_cards.CARD_CREATION_FEE_USD),
+        "ghs_per_usd": rate,
+        "fees": {
+            "creation_usd": Decimal(bitnob_cards.CARD_CREATION_FEE_USD),
+            "funding_flat_usd": Decimal(bitnob_cards.FUNDING_FEE_FLAT_USD),
+            "funding_flat_below_usd": Decimal(bitnob_cards.FUNDING_FEE_FLAT_BELOW_USD),
+            "funding_percent": Decimal(bitnob_cards.FUNDING_FEE_PERCENT),
+        },
     }
 
 
@@ -69,7 +130,8 @@ async def _ensure_card_slot_available(local_phone_number: str) -> None:
     """Check Bitnob's per-customer lite-card cap BEFORE taking payment -
     previously this was only discovered when card creation failed after the
     charge ("customer already has 3 active cards, maximum is 3"). Fails
-    closed if Bitnob can't be reached, same reasoning as the top-up check."""
+    closed if Bitnob can't be reached: a refused request is recoverable, a
+    charge that can't be delivered needs a refund."""
     try:
         customer = await bitnob_cards.find_customer_by_phone(local_phone_number)
     except bitnob_cards.BitnobError as e:
@@ -89,28 +151,20 @@ async def _ensure_card_slot_available(local_phone_number: str) -> None:
 
 
 async def initiate_card_creation(session: AsyncSession, user: User, data: CardCreate) -> dict:
-    await check_transaction_limit(session, user, data.initial_funding_ghs)
-
-    amount_usd = _ghs_to_usd(data.initial_funding_ghs)
-    limits = get_card_limits()
-    if amount_usd < MIN_CARD_USD:
-        raise HTTPException(status_code=400, detail=f"Minimum card load is GHS {limits['min_load_ghs']} (${MIN_CARD_USD} equivalent)")
-    if amount_usd > MAX_CARD_LOAD_USD:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Maximum card load is GHS {limits['max_load_ghs']} (${MAX_CARD_LOAD_USD}) - "
-            f"cards are loaded once and can't be topped up later",
-        )
+    priced = price_load(data.initial_funding_ghs)
+    await kyc_limits.check_transaction_limit(session, user, priced["total_ghs"])
 
     local_phone = _normalize_local_phone(data.dial_code, data.local_phone_number)
     if not local_phone:
         raise HTTPException(status_code=400, detail="Enter the card phone number")
     await _ensure_card_slot_available(local_phone)
+    await _ensure_float_covers(priced["amount_usd"], priced["fee_usd"])
 
     reference = f"card-{uuid.uuid4().hex[:14]}"
     card = VirtualCard(
         user_id=user.id,
-        initial_funding_ghs=data.initial_funding_ghs,
+        initial_funding_ghs=priced["amount_ghs"],
+        fee_ghs=priced["fee_ghs"],
         payment_reference=reference,
         dial_code=data.dial_code,
         local_phone_number=local_phone,
@@ -120,7 +174,7 @@ async def initiate_card_creation(session: AsyncSession, user: User, data: CardCr
 
     checkout = await paystack.initialize_transaction(
         email=data.sender_email,
-        amount=data.initial_funding_ghs,
+        amount=card.charged_ghs,
         reference=reference,
         metadata={"type": "card_creation", "card_id": str(card.id)},
     )
@@ -144,6 +198,7 @@ async def _attempt_card_creation(card: VirtualCard, user: User) -> None:
             dial_code=card.dial_code,
             amount=amount_usd,
         )
+        bitnob_balance.record_debit("USDC", amount_usd + _bitnob_fees_usd(amount_usd))
         card_data = result_data.get("data", {}).get("card", {})
         card.bitnob_card_id = card_data.get("id")
         card.bitnob_customer_id = card_data.get("customer_id")
@@ -180,7 +235,7 @@ async def confirm_card_payment(session: AsyncSession, reference: str) -> Virtual
         return card
 
     user = await session.get(User, card.user_id)
-    record_transaction_volume(session, user.id, card.initial_funding_ghs, "card_creation")
+    kyc_limits.record_transaction_volume(session, user.id, card.charged_ghs, "card_creation")
     await _attempt_card_creation(card, user)
 
     session.add(card)
@@ -237,6 +292,7 @@ async def sync_card_status(session: AsyncSession, card: VirtualCard) -> VirtualC
         result = await bitnob_cards.get_card(card.bitnob_card_id)
         card_data = result.get("data", {}).get("card", {})
         bitnob_status = card_data.get("status", "")
+        balance_before = card.balance
         card.masked_pan = card_data.get("masked_pan", card.masked_pan)
         card.card_brand = card_data.get("card_brand", card.card_brand)
         card.balance = bitnob_cards.from_micro_units(int(card_data.get("balance_amount", 0)))
@@ -252,6 +308,14 @@ async def sync_card_status(session: AsyncSession, card: VirtualCard) -> VirtualC
         session.add(card)
         await session.commit()
         await session.refresh(card)
+
+        # Terminated outside the app (Bitnob's decline rule, the dashboard) and
+        # the webhook hasn't told us: pay out the last balance we saw. Balance
+        # after termination reads 0, hence balance_before.
+        if bitnob_status == "terminated" and card.termination_payout_status == TerminationPayoutStatus.NOT_STARTED:
+            card = await termination_payout.start_termination_payout(
+                session, card.id, balance_before, source="status sync"
+            ) or card
     except bitnob_cards.BitnobError:
         pass  # keep last-known state rather than fail the read
 
@@ -312,185 +376,37 @@ async def unfreeze_card(session: AsyncSession, card: VirtualCard) -> VirtualCard
 async def terminate_card(session: AsyncSession, card: VirtualCard, data: CardTerminate) -> VirtualCard:
     if card.status in (CardStatus.TERMINATED, CardStatus.PENDING_PAYMENT, CardStatus.PROVISIONING):
         raise HTTPException(status_code=400, detail=f"Cannot terminate a card in status '{card.status}'")
+    # Last known balance, as a fallback if Bitnob's response doesn't say what it returned.
+    balance_before = card.balance
+    try:
+        card_data = (await bitnob_cards.get_card(card.bitnob_card_id)).get("data", {}).get("card", {})
+        balance_before = bitnob_cards.from_micro_units(int(card_data.get("balance_amount", 0)))
+    except (bitnob_cards.BitnobError, ValueError, TypeError):
+        pass
     try:
         # Bitnob blocks termination within 24h of creation - surfaces as a
         # normal BitnobError here, not a special case, since it's just
         # another validation rule from their side.
-        await bitnob_cards.terminate_card(card.bitnob_card_id, data.reason)
+        result = await bitnob_cards.terminate_card(card.bitnob_card_id, data.reason)
     except bitnob_cards.BitnobError as e:
         raise HTTPException(status_code=400, detail=e.user_message()) from e
-    card.status = CardStatus.TERMINATED
-    card.updated_at = datetime.now(timezone.utc)
-    session.add(card)
-    await session.commit()
-    await session.refresh(card)
-    return card
 
-
-async def _ensure_card_accepts_topups(card: VirtualCard) -> None:
-    """Refuse a top-up BEFORE the Paystack checkout, not after the money is taken.
-
-    Confirmed live 2026-09-29: Bitnob rejects every top-up on a lite card
-    ("topups are not supported for lite cards") - a lite card is funded once,
-    at creation, and create_lite_card is the only way this app issues cards.
-    The card's type is read from Bitnob rather than assumed, so a card type
-    that does support top-ups keeps working if one is ever issued. If Bitnob
-    can't be reached, fail closed: a refused top-up is recoverable, a charge
-    that can't be delivered needs a refund."""
-    if card.bitnob_card_id is None:
-        raise HTTPException(status_code=400, detail="This card can't be topped up")
+    # Bitnob sends the leftover balance to the company wallet; pay it to the owner.
+    returned = (result or {}).get("data") or {}
+    refund_usd = balance_before
     try:
-        card_data = (await bitnob_cards.get_card(card.bitnob_card_id)).get("data", {}).get("card", {})
-    except bitnob_cards.BitnobError as e:
-        raise HTTPException(
-            status_code=503, detail="Couldn't confirm this card can be topped up right now - please try again shortly"
-        ) from e
-    if card_data.get("card_type") == "lite":
-        raise HTTPException(
-            status_code=400,
-            detail="This card can't be topped up - it's a lite card, which is funded once when it's created. "
-            "Create a new card to add more funds.",
-        )
-
-
-async def initiate_card_funding(session: AsyncSession, card: VirtualCard, data: CardFundingCreate) -> dict:
-    if card.status != CardStatus.ACTIVE:
-        raise HTTPException(status_code=400, detail="Can only fund an active card")
-
-    await _ensure_card_accepts_topups(card)
-
-    owner = await session.get(User, card.user_id)
-    await check_transaction_limit(session, owner, data.amount_ghs)
-
-    amount_usd = _ghs_to_usd(data.amount_ghs)
-    # Confirmed live: Bitnob enforces the same $2 minimum on top-ups as on
-    # initial card creation - caught by a real funding request failing
-    # with "amount below minimum funding of $2" after payment had already
-    # been collected, which is exactly the failure mode worth checking for
-    # upfront instead of after the user's paid.
-    if amount_usd < MIN_CARD_USD:
-        raise HTTPException(status_code=400, detail=f"Minimum top-up is ~GHS {MIN_CARD_USD * Decimal(str(settings.DEMO_GHS_USD_RATE)):.2f} (${MIN_CARD_USD} equivalent)")
-    if amount_usd > MAX_TOPUP_USD:
-        raise HTTPException(status_code=400, detail=f"Maximum top-up is ~GHS {MAX_TOPUP_USD * Decimal(str(settings.DEMO_GHS_USD_RATE)):.2f} (${MAX_TOPUP_USD} equivalent)")
-
-    reference = f"cardtopup-{uuid.uuid4().hex[:14]}"
-    funding = CardFunding(
-        card_id=card.id, amount_ghs=data.amount_ghs, amount_usd=amount_usd, payment_reference=reference
-    )
-    session.add(funding)
-    await session.commit()
-
-    checkout = await paystack.initialize_transaction(
-        email=data.sender_email,
-        amount=data.amount_ghs,
-        reference=reference,
-        metadata={"type": "card_funding", "funding_id": str(funding.id)},
-    )
-    return {"authorization_url": checkout["authorization_url"], "reference": reference}
-
-
-async def list_card_fundings(session: AsyncSession, card: VirtualCard) -> list[CardFunding]:
-    result = await session.exec(
-        select(CardFunding)
-        .where(CardFunding.card_id == card.id)
-        .order_by(CardFunding.created_at.desc())
-    )
-    return list(result.all())
-
-
-async def get_card_funding(session: AsyncSession, card: VirtualCard, funding_id: uuid.UUID) -> CardFunding:
-    funding = await session.get(CardFunding, funding_id)
-    if funding is None or funding.card_id != card.id:
-        raise HTTPException(status_code=404, detail="Card funding not found")
-    return funding
-
-
-async def _attempt_card_funding(funding: CardFunding, card: VirtualCard) -> None:
-    """Mutates funding.status/failure_reason in place. Never raises: the
-    GHS payment has already been collected by the time this runs (both on
-    first attempt and on retry), so any failure here must land in
-    DELIVERY_FAILED, not bubble up."""
-    try:
-        await bitnob_cards.fund_card(card.bitnob_card_id, funding.amount_usd, funding.payment_reference)
-        funding.status = FundingStatus.COMPLETED
-    except bitnob_cards.BitnobError as e:
-        funding.status = FundingStatus.DELIVERY_FAILED
-        funding.failure_reason = f"Bitnob sandbox call failed: {e.user_message()}"
-
-
-async def confirm_card_funding(session: AsyncSession, reference: str) -> CardFunding:
-    # Locked: webhook, refresh poll and reconcile sweep may all race here.
-    funding = await locked_first(session, CardFunding, CardFunding.payment_reference == reference)
-    if funding is None:
-        raise HTTPException(status_code=404, detail="Card funding not found")
-
-    if funding.status != FundingStatus.PENDING_PAYMENT:
-        return funding
-
-    verified = await paystack.verify_transaction(reference)
-    if verified.get("status") != "success":
-        funding.status = FundingStatus.FAILED
-        funding.failure_reason = "GHS payment not successful"
-        session.add(funding)
-        await session.commit()
-        return funding
-
-    card = await session.get(VirtualCard, funding.card_id)
-    record_transaction_volume(session, card.user_id, funding.amount_ghs, "card_funding")
-    await _attempt_card_funding(funding, card)
-
-    session.add(funding)
-    await session.commit()
-    await session.refresh(funding)
-
-    if funding.status == FundingStatus.COMPLETED:
-        await sync_card_status(session, card)
-
-    return funding
-
-
-async def retry_card_funding(session: AsyncSession, card: VirtualCard, funding: CardFunding) -> CardFunding:
-    if funding.status != FundingStatus.DELIVERY_FAILED:
-        raise HTTPException(
-            status_code=400, detail="Only a top-up stuck after payment (delivery_failed) can be retried"
-        )
-    if funding.retry_count >= MAX_DELIVERY_RETRIES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Retry limit reached ({MAX_DELIVERY_RETRIES}) - request a refund instead",
-        )
-    # A top-up on a lite card fails the same way every time, so a retry would
-    # only burn an attempt - send the user to Refund instead.
-    try:
-        await _ensure_card_accepts_topups(card)
-    except HTTPException as e:
-        if e.status_code == 400:
-            raise HTTPException(
-                status_code=400, detail="This card can't be topped up, so this payment can't be delivered - request a refund instead"
-            ) from e
-        raise
-
-    funding.retry_count += 1
-    await _attempt_card_funding(funding, card)
-    session.add(funding)
-    await session.commit()
-    await session.refresh(funding)
-
-    if funding.status == FundingStatus.COMPLETED:
-        await sync_card_status(session, card)
-        user = await session.get(User, card.user_id)
-        await send_sms(user.phone_number, "Good news - your card top-up went through on retry.")
-    return funding
-
-
-async def refund_card_funding(session: AsyncSession, funding: CardFunding) -> CardFunding:
-    """Moves the top-up to REFUND_PENDING; REFUNDED only once Paystack reports
-    the refund processed - see src/payments/refunds.py."""
-    return await refunds.start_refund(session, refunds.CARD_FUNDING, funding.id)
+        if returned.get("remaining_balance") is not None:
+            refund_usd = bitnob_cards.from_micro_units(int(returned["remaining_balance"]))
+    except (ValueError, TypeError):
+        pass
+    if returned.get("balance_returned") is False:
+        refund_usd = Decimal("0")
+    paid = await termination_payout.start_termination_payout(session, card.id, refund_usd, source="owner")
+    return paid or card
 
 
 async def list_card_transactions(session: AsyncSession, card: VirtualCard) -> list[CardTransactionRead]:
-    """Build a unified transaction history from local funding records and
+    """Build a unified transaction history from the card's initial load and
     (when the card has been issued) Bitnob's card transactions feed."""
     items: list[CardTransactionRead] = []
 
@@ -504,6 +420,8 @@ async def list_card_transactions(session: AsyncSession, card: VirtualCard) -> li
             if card.refunded_at
             else "Initial card funding"
         )
+        if card.fee_ghs:
+            desc = f"{desc} (+ GHS {card.fee_ghs} card fees)"
         items.append(
             CardTransactionRead(
                 id=f"local-initial-{card.id}",
@@ -522,37 +440,6 @@ async def list_card_transactions(session: AsyncSession, card: VirtualCard) -> li
             )
         )
 
-    fundings = await list_card_fundings(session, card)
-    for f in fundings:
-        st = f.status.value if hasattr(f.status, "value") else str(f.status)
-        if f.refunded_at or st.lower() in ("refunded",):
-            kind, direction, desc = "refund", "debit", "Top-up refunded"
-        elif st.lower() in ("completed",):
-            kind, direction, desc = "funding", "credit", "Card top-up"
-        elif "fail" in st.lower():
-            kind, direction, desc = "funding", "credit", f"Top-up failed"
-        else:
-            kind, direction, desc = "funding", "credit", "Top-up pending"
-        if f.failure_reason:
-            desc = f"{desc}: {f.failure_reason}"
-        items.append(
-            CardTransactionRead(
-                id=f"local-funding-{f.id}",
-                card_id=card.id,
-                kind=kind,
-                direction=direction,
-                amount=f.amount_ghs,
-                currency="GHS",
-                amount_ghs=f.amount_ghs,
-                amount_usd=f.amount_usd,
-                status=st,
-                description=desc,
-                reference=f.payment_reference or f.refund_reference,
-                source="local",
-                created_at=f.created_at,
-            )
-        )
-
     # Provider-side spend / network activity (sandbox or live Bitnob)
     if card.bitnob_card_id:
         try:
@@ -560,24 +447,30 @@ async def list_card_transactions(session: AsyncSession, card: VirtualCard) -> li
             rows = remote
             if isinstance(remote, dict):
                 rows = remote.get("data") or remote.get("transactions") or remote.get("results") or []
+            # Bitnob nests the list one level down ({"data": {"transactions": [...]}},
+            # confirmed live) - the dict used to be dropped here, so no Bitnob-side
+            # transaction ever reached the app.
+            if isinstance(rows, dict):
+                rows = rows.get("transactions") or rows.get("results") or []
             if not isinstance(rows, list):
                 rows = []
             for row in rows:
                 if not isinstance(row, dict):
                     continue
                 txn_id = str(row.get("id") or row.get("transaction_id") or row.get("reference") or "")
-                amount_raw = row.get("amount") or row.get("display_amount")
                 amount = None
                 currency = str(row.get("currency") or "USD")
-                if amount_raw is not None:
-                    try:
-                        # Bitnob often uses micro-units for amount
-                        if isinstance(amount_raw, int) and abs(amount_raw) > 1000:
-                            amount = bitnob_cards.from_micro_units(abs(amount_raw))
-                        else:
-                            amount = Decimal(str(amount_raw))
-                    except Exception:
-                        amount = None
+                try:
+                    display = row.get("display_amount") if row.get("display_amount") is not None else row.get("displayAmount")
+                    if display is not None:
+                        amount = Decimal(str(display)).quantize(Decimal("0.01"))
+                    elif row.get("amount") is not None:
+                        # `amount` is always micro-units (1 USD = 1,000,000) and
+                        # arrives as a STRING (e.g. "1000000") - the old int-only
+                        # check showed a $1 fee as "1000000 USD".
+                        amount = bitnob_cards.from_micro_units(abs(int(Decimal(str(row["amount"])))))
+                except Exception:
+                    amount = None
                 txn_type = str(
                     row.get("transaction_type")
                     or row.get("type")
@@ -632,6 +525,33 @@ async def list_card_transactions(session: AsyncSession, card: VirtualCard) -> li
             pass
         except Exception:
             pass
+
+    # Declines never appear in Bitnob's transaction feed; they only arrive as
+    # webhooks (card_events), so add them here or the cardholder can't see why
+    # a payment failed.
+    declined = await session.exec(
+        select(CardEvent)
+        .where(CardEvent.card_id == card.id, CardEvent.event_type.contains("declin"))
+        .order_by(CardEvent.created_at.desc())
+    )
+    for ev in declined.all():
+        items.append(
+            CardTransactionRead(
+                id=f"event-{ev.event_id}",
+                card_id=card.id,
+                kind="decline",
+                direction="neutral",
+                amount=ev.amount_usd,
+                currency="USD",
+                amount_usd=ev.amount_usd,
+                status="declined",
+                description=f"Declined{': ' + ev.reason if ev.reason else ''}",
+                merchant_name=ev.merchant,
+                reference=ev.reference,
+                source="bitnob",
+                created_at=ev.created_at,
+            )
+        )
 
     items.sort(key=lambda t: t.created_at or card.created_at, reverse=True)
     return items

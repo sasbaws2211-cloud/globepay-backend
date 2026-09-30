@@ -5,7 +5,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.admin import service
 from src.admin.schemas import (
-    AdminKycReject,
+    AdminKycTierUpdate,
     AdminUserDetail,
     AdminUserStatusUpdate,
     AdminUserSummary,
@@ -17,7 +17,7 @@ from src.auth.dependencies import get_current_admin
 from src.auth.models import User
 from src.auth.schemas import UserRead
 from src.cards import service as card_service
-from src.cards.schemas import CardFundingRead, CardRead
+from src.cards.schemas import CardRead
 from src.crossborder import service as crossborder_service
 from src.crossborder.schemas import CrossBorderRead
 from src.db.main import get_session
@@ -63,35 +63,19 @@ async def update_user_status(
     return user
 
 
-@router.get("/kyc/pending", response_model=list[UserRead])
-async def pending_kyc(session: AsyncSession = Depends(get_session)):
-    return await service.list_pending_kyc(session)
-
-
-@router.post("/kyc/{user_id}/approve", response_model=UserRead)
-async def approve_kyc(
+@router.patch("/users/{user_id}/kyc-tier", response_model=AdminUserSummary)
+async def update_user_kyc_tier(
     user_id: uuid.UUID,
+    payload: AdminKycTierUpdate,
     current_admin: User = Depends(get_current_admin),
     session: AsyncSession = Depends(get_session),
 ):
-    user = await service.approve_kyc(session, user_id)
+    """Set a user's verification tier - the only way to reach ID_VERIFIED.
+    Changes their transaction limits; audited with the reason given."""
+    user, previous = await service.set_user_kyc_tier(session, user_id, payload.kyc_tier)
     await service.log_admin_action(
-        session, current_admin.id, "approve_kyc", "user", user_id,
-        details={"ghana_card_number": user.ghana_card_number},
-    )
-    return user
-
-
-@router.post("/kyc/{user_id}/reject", response_model=UserRead)
-async def reject_kyc(
-    user_id: uuid.UUID,
-    payload: AdminKycReject,
-    current_admin: User = Depends(get_current_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    user = await service.reject_kyc(session, user_id, payload.reason)
-    await service.log_admin_action(
-        session, current_admin.id, "reject_kyc", "user", user_id, details={"reason": payload.reason}
+        session, current_admin.id, "set_kyc_tier", "user", user_id,
+        details={"from": previous.value, "to": payload.kyc_tier.value, "reason": payload.reason},
     )
     return user
 
@@ -152,36 +136,5 @@ async def refund_card_creation(
     await service.log_admin_action(
         session, current_admin.id, "refund_card_creation", "card", card_id,
         details={"amount": str(result.initial_funding_ghs)},
-    )
-    return result
-
-
-@router.post("/cards/fundings/{funding_id}/retry", response_model=CardFundingRead)
-async def retry_card_funding(
-    funding_id: uuid.UUID,
-    current_admin: User = Depends(get_current_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    funding = await service.get_card_funding(session, funding_id)
-    card = await service.get_card(session, funding.card_id)
-    result = await card_service.retry_card_funding(session, card, funding)
-    await service.log_admin_action(
-        session, current_admin.id, "retry_card_funding", "card_funding", funding_id,
-        details={"resulting_status": result.status.value},
-    )
-    return result
-
-
-@router.post("/cards/fundings/{funding_id}/refund", response_model=CardFundingRead)
-async def refund_card_funding(
-    funding_id: uuid.UUID,
-    current_admin: User = Depends(get_current_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    funding = await service.get_card_funding(session, funding_id)
-    result = await card_service.refund_card_funding(session, funding)
-    await service.log_admin_action(
-        session, current_admin.id, "refund_card_funding", "card_funding", funding_id,
-        details={"amount": str(result.amount_ghs)},
     )
     return result

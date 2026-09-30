@@ -19,9 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlmodel.ext.asyncio.session import AsyncSession  # noqa: E402
 
-from src.auth.models import KycStatus, KycTier, ReferralRewardStatus, User  # noqa: E402
+from src.auth.models import ReferralRewardStatus, User  # noqa: E402
 from src.auth.utils import hash_password  # noqa: E402
-from src.cards.models import CardFunding, CardStatus, FundingStatus, VirtualCard  # noqa: E402
+from src.cards.models import CardStatus, VirtualCard  # noqa: E402
 from src.crossborder.models import CrossBorderStatus, CrossBorderTransfer  # noqa: E402
 from src.db.main import engine  # noqa: E402
 from src.splitbill.models import ShareStatus, SplitBill, SplitBillShare, SplitBillStatus  # noqa: E402
@@ -63,9 +63,6 @@ async def seed() -> None:
                 email="ama.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
-                kyc_tier=KycTier.ID_VERIFIED,
-                kyc_status=KycStatus.APPROVED,
-                ghana_card_number="GHA-DEM-0001",
                 referral_code="AMA2026",
                 referral_reward_status=ReferralRewardStatus.REWARDED,
                 default_momo_number="+233240000001",
@@ -79,8 +76,6 @@ async def seed() -> None:
                 email="kojo.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
-                kyc_tier=KycTier.PHONE_VERIFIED,
-                kyc_status=KycStatus.NONE,
                 referral_code="KOJO2026",
                 referral_reward_status=ReferralRewardStatus.NONE,
                 default_momo_number="+233240000002",
@@ -94,8 +89,6 @@ async def seed() -> None:
                 email="efua.demo@example.com",
                 hashed_password=hash_password(DEMO_PASSWORD),
                 is_phone_verified=True,
-                kyc_tier=KycTier.PHONE_VERIFIED,
-                kyc_status=KycStatus.PENDING,
                 referral_code="EFUA2026",
                 referral_reward_status=ReferralRewardStatus.PENDING,
                 default_momo_number="+233240000003",
@@ -243,18 +236,6 @@ async def seed() -> None:
             local_phone_number="200000001",
         )
         await add_if_missing(session, card, "virtual card")
-        await add_if_missing(
-            session,
-            CardFunding(
-                id=stable_id("card-funding:ama:1"),
-                card_id=card.id,
-                amount_ghs=Decimal("250.00"),
-                amount_usd=Decimal("16.13"),
-                status=FundingStatus.COMPLETED,
-                payment_reference="demo_card_funding_001",
-            ),
-            "card funding",
-        )
 
         await add_if_missing(
             session,

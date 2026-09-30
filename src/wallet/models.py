@@ -44,6 +44,9 @@ class WalletTransfer(SQLModel, table=True):
 
     status: TransferStatus = Field(default=TransferStatus.PENDING_PAYMENT)
     payment_reference: str | None = Field(default=None, index=True)
+    # Paystack checkout for this transfer, kept so an unpaid transfer can be
+    # paid later (e.g. the sender closed the popup) instead of being stuck.
+    authorization_url: str | None = Field(default=None)
     payout_reference: str | None = Field(default=None)
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=tz_aware_column())

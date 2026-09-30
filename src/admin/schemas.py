@@ -2,8 +2,9 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from src.auth.models import KycTier
 
 
 class AdminUserSummary(BaseModel):
@@ -13,6 +14,7 @@ class AdminUserSummary(BaseModel):
     email: str | None
     is_active: bool
     is_admin: bool
+    kyc_tier: KycTier = KycTier.UNVERIFIED
     created_at: datetime
 
 
@@ -25,12 +27,13 @@ class AdminUserStatusUpdate(BaseModel):
     is_active: bool
 
 
-class AdminKycReject(BaseModel):
-    reason: str
+class AdminKycTierUpdate(BaseModel):
+    kyc_tier: KycTier
+    reason: str = Field(min_length=3, max_length=500)  # e.g. "Ghana Card checked in branch" - kept in the audit log
 
 
 class StuckTransaction(BaseModel):
-    kind: str  # "crossborder_transfer" | "card_creation" | "card_funding"
+    kind: str  # "crossborder_transfer" | "card_creation"
     id: uuid.UUID
     user_id: uuid.UUID
     user_phone: str

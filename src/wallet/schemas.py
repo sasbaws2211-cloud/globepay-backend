@@ -32,6 +32,30 @@ class TransferRead(BaseModel):
     status: TransferStatus
     created_at: datetime
     completed_at: datetime | None
+    # Viewer-relative (filled by service.to_read): which side of the transfer
+    # the requesting user is on, and who the other party is.
+    direction: str | None = None  # "sent" | "received"
+    counterparty_name: str | None = None
+    counterparty_phone: str | None = None  # masked, e.g. "+233 20 *** 0002"
+    # Only for the sender of an unpaid transfer: reopen its Paystack checkout.
+    pay_url: str | None = None
+
+
+class TransferQuoteRequest(BaseModel):
+    recipient_phone_number: str
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+
+
+class TransferQuote(BaseModel):
+    """What the sender sees before paying - nothing is created or charged."""
+
+    recipient_name: str  # first name + last initial, to confirm the right person
+    recipient_phone: str  # masked
+    amount: Decimal  # what the sender is sending
+    platform_fee: Decimal  # deducted from what the recipient gets
+    recipient_gets: Decimal
+    roundup_amount: Decimal  # swept into the sender's round-up vault, if enabled
+    total_charge: Decimal  # what Paystack will charge the sender
 
 
 class WalletSummary(BaseModel):

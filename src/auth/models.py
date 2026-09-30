@@ -3,35 +3,25 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
 
-from sqlalchemy import Column, ForeignKey
+from sqlalchemy import JSON, Column, ForeignKey
 from sqlalchemy import Uuid as SAUuid
 from sqlmodel import Field, SQLModel
 
 from src.common.db_types import named_enum_column, tz_aware_column
 
 
-class KycTier(StrEnum):
-    """Mirrors the shape of Bank of Ghana's tiered e-money KYC framework -
-    higher verification unlocks higher transaction volume, enforced in
-    src/common/kyc_limits.py. Nothing here is a real regulatory
-    integration (see KycStatus/ghana_card_number below)."""
-
-    UNVERIFIED = "unverified"  # phone + password only
-    PHONE_VERIFIED = "phone_verified"  # completed OTP verification of their phone
-    ID_VERIFIED = "id_verified"  # Ghana Card submitted and approved by an admin
-
-
-class KycStatus(StrEnum):
-    NONE = "none"  # never submitted an ID
-    PENDING = "pending"  # submitted, awaiting admin review
-    APPROVED = "approved"
-    REJECTED = "rejected"  # can resubmit
-
-
 class ReferralRewardStatus(StrEnum):
     NONE = "none"  # not referred by anyone
     PENDING = "pending"  # referred, hasn't yet made a qualifying first deposit
     REWARDED = "rewarded"  # both sides already credited - see src/vaults/service.py
+
+
+class KycTier(StrEnum):
+    """Verification level - sets the transaction limits (common/kyc_limits.py)."""
+
+    UNVERIFIED = "unverified"
+    PHONE_VERIFIED = "phone_verified"  # confirmed an SMS code to their number
+    ID_VERIFIED = "id_verified"  # identity checked (set by an admin)
 
 
 class User(SQLModel, table=True):
@@ -45,6 +35,7 @@ class User(SQLModel, table=True):
 
     is_active: bool = Field(default=True)
     is_phone_verified: bool = Field(default=False)
+    kyc_tier: KycTier = Field(default=KycTier.UNVERIFIED, sa_column=named_enum_column(KycTier, "kyc_tier"))
 
     # Embedded in every access token issued at login (see
     # create_access_token/get_current_user) so a password reset actually
@@ -68,22 +59,18 @@ class User(SQLModel, table=True):
     # with each other (an admin "reactivating" is_active on a self-closed
     # account should not silently let them log back in). One-way in this
     # version - no reopen endpoint exists. Closing does NOT scramble
-    # phone_number, kyc_tier/kyc_status, or any transaction/ledger row -
+    # phone_number or any transaction/ledger row -
     # this app is not a real regulated entity, but the honest modeling of
     # one would need to retain identity-linked financial records for an
     # AML retention period, not erase them on request, so this doesn't
     # pretend otherwise. See close_account for exactly what does get cleared.
     closed_at: datetime | None = Field(default=None, sa_column=tz_aware_column(nullable=True))
 
-    # Tiered KYC - see KycTier. ghana_card_number is stored as submitted,
-    # not verified against any real Ghana Card / NIA lookup - this is a
-    # pitch-stage placeholder for a real ID-verification integration, not
-    # actual AML/KYC compliance. Approval is a human admin decision
-    # (src/admin/), which is the honest framing until a real check exists.
-    kyc_tier: KycTier = Field(default=KycTier.UNVERIFIED, sa_column=named_enum_column(KycTier, "kyc_tier"))
-    kyc_status: KycStatus = Field(default=KycStatus.NONE, sa_column=named_enum_column(KycStatus, "kyc_status"))
-    ghana_card_number: str | None = Field(default=None)
-    kyc_rejection_reason: str | None = Field(default=None)
+    # Sender details bank/SWIFT payouts require (address, date and country of
+    # birth, ...), exactly as last sent in a cross-border transfer's `sender`
+    # block - saved on request so the form can prefill them next time.
+    sender_profile: dict | None = Field(default=None, sa_column=Column(JSON, nullable=True))
+
 
     # Referrals - see src/vaults/service.py for the reward trigger (a
     # referred user's first confirmed vault contribution). No defense here
@@ -134,6 +121,11 @@ class User(SQLModel, table=True):
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=tz_aware_column())
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=tz_aware_column())
+
+    @property
+    def has_saved_card(self) -> bool:
+        """Whether auto-contribute can be switched on - without exposing the token."""
+        return bool(self.paystack_authorization_code)
 
 
 class OtpPurpose(StrEnum):
